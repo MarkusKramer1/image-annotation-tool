@@ -1,25 +1,19 @@
 name: image-annotation
 channels:
-  - defaults
+  - pytorch
+  - nvidia
   - conda-forge
+  - defaults
 dependencies:
   - python=3.11
+  - pytorch=2.5.1
+  - torchvision=0.20.1
+  - pytorch-cuda=12.1
   - pip
   - pip:
-    - torch==2.5.1 --index-url https://download.pytorch.org/whl/cu124
-    - torchvision==0.20.1 --index-url https://download.pytorch.org/whl/cu124
-    - mmengine==0.10.7
-    - mmdet==3.3.0
-    - transformers==4.57.1
-    - accelerate==1.10.0
-    - einops
-    - scikit-learn
-    - hdbscan
-    - numpy
-    - scipy
-    - streamlit==1.43.0
+    - streamlit>=1.43
     - Pillow
     - opencv-python-headless
-    - av
+    - pandas
     - tqdm
     - pycocotools

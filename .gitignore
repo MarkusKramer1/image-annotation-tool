@@ -3,8 +3,12 @@ __pycache__/
 *.pyo
 .env
 .venv/
-output/images/
-output/annotated/
-output/annotations.json
 *.egg-info/
 .DS_Store
+
+# Runtime data
+data/
+
+# Large model checkpoints (download separately)
+WeDetect/checkpoints/*.pth
+WeDetect/checkpoints/wedetect_ref_*/
