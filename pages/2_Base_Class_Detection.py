@@ -1,14 +1,19 @@
 """Page 2 — Base Class Detection: run WeDetect on extracted frames."""
 
+from __future__ import annotations
+
 import json
 import os
 import subprocess
 import sys
 import threading
 from pathlib import Path
+from typing import Any
 
+import numpy as np
 import pandas as pd
 import streamlit as st
+from PIL import Image
 
 from src.common import (
     CONFIG_MAP,
@@ -20,8 +25,57 @@ from src.common import (
     discover_datasets,
     load_extraction_meta,
 )
+from src.detection_gallery import (
+    build_gallery_entries,
+    crop_bbox,
+    draw_detections,
+    load_detection_data,
+)
+from src.similarity_search import embed_crops, find_similar
 
 st.set_page_config(page_title="Base Class Detection", page_icon="🔍", layout="wide")
+
+if "gallery_ready_dataset" not in st.session_state:
+    st.session_state["gallery_ready_dataset"] = None
+
+
+# ─── Helpers (defined at module top to avoid forward-reference issues) ────────
+
+def _remove_annotations(ann_path: Path, ann_ids: set[int]) -> None:
+    """Remove annotations by ID from the COCO JSON file and refresh UI state.
+
+    Args:
+        ann_path: Path to the base_detection.json file.
+        ann_ids: Set of COCO annotation IDs to delete.
+    """
+    if not ann_ids:
+        st.warning("No annotation IDs to remove.")
+        return
+
+    try:
+        with open(ann_path) as fh:
+            coco_data = json.load(fh)
+
+        original_count = len(coco_data.get("annotations", []))
+        coco_data["annotations"] = [
+            a for a in coco_data["annotations"] if a["id"] not in ann_ids
+        ]
+        removed = original_count - len(coco_data["annotations"])
+
+        with open(ann_path, "w") as fh:
+            json.dump(coco_data, fh, indent=2)
+
+        # Clear cached gallery so it reloads from updated file
+        _load_gallery.clear()
+        st.session_state.pop("selected_wrong_bboxes", None)
+        st.session_state.pop("similarity_matches", None)
+        st.session_state.pop("similarity_wrong_ids", None)
+
+        st.success(f"Removed {removed} annotation(s). Refreshing…")
+        st.rerun()
+
+    except Exception as exc:
+        st.error(f"Failed to update annotation file: {exc}")
 
 st.title("Base Class Detection")
 st.caption(
@@ -292,8 +346,9 @@ if should_run and can_run:
 
     st.session_state.detection_test_mode = False
 
-    # ── Results ───────────────────────────────────────────────────────────────
+    # ── Summary table ─────────────────────────────────────────────────────────
     if done_data:
+        st.session_state["gallery_ready_dataset"] = selected_dataset
         st.success(
             f"Done — annotation file saved to `{done_data['annotation_path']}`"
         )
@@ -313,3 +368,311 @@ if should_run and can_run:
     if stderr_lines:
         with st.expander("Process output / errors"):
             st.code("\n".join(stderr_lines[-200:]), language=None)
+
+# ─── Results gallery (shown only after pressing Run Detection) ───────────────
+
+if st.session_state.get("gallery_ready_dataset") != selected_dataset:
+    st.info("Klicke **Run Detection**, dann erscheint direkt darunter die scrollbare Bildliste.")
+    st.stop()
+
+output_json_path = dataset_dir / "annotations" / "base_detection.json"
+
+if not output_json_path.exists():
+    st.warning("Noch keine Detection-Ergebnisse für dieses Dataset gefunden.")
+    st.stop()
+
+st.divider()
+
+# ── Load annotation data ──────────────────────────────────────────────────────
+
+@st.cache_data(show_spinner=False)
+def _load_gallery(ann_path: str, images_dir: str, file_sig: float) -> list[dict[str, Any]]:
+    """Load and build gallery entries.
+
+    file_sig is typically the annotation file mtime and is included only to bust
+    Streamlit cache whenever base_detection.json changes.
+    """
+    _ = file_sig
+    coco = load_detection_data(Path(ann_path))
+    return build_gallery_entries(coco, Path(images_dir))
+
+
+file_sig = output_json_path.stat().st_mtime
+gallery = _load_gallery(str(output_json_path), str(frames_dir), file_sig)
+
+if not gallery:
+    st.info("No images found in the annotation file.")
+    st.stop()
+
+num_with_dets = sum(1 for e in gallery if e["annotations"])
+num_total_dets = sum(len(e["annotations"]) for e in gallery)
+st.caption(
+    f"Scrollbare Liste: {len(gallery)} Bilder gesamt, {num_with_dets} mit Detections, "
+    f"{num_total_dets} Bounding Boxen."
+)
+
+# ── Gallery rendering ─────────────────────────────────────────────────────────
+
+GALLERY_COLS = 3
+
+
+def _render_gallery(
+    entries: list[dict[str, Any]],
+    highlighted_bbox_ids: set[str] | None = None,
+    container_height: int = 600,
+) -> None:
+    """Render a gallery of annotated images in a scrollable container."""
+    with st.container(height=container_height):
+        cols = st.columns(GALLERY_COLS)
+        for i, entry in enumerate(entries):
+            col = cols[i % GALLERY_COLS]
+            try:
+                rendered = draw_detections(
+                    entry["image_path"],
+                    entry["annotations"],
+                    entry["img_idx"],
+                    highlighted_bbox_ids=highlighted_bbox_ids,
+                )
+                ann_count = len(entry["annotations"])
+                col.image(
+                    rendered,
+                    caption=f"#{entry['img_idx']} · {entry['file_name']} · {ann_count} det",
+                    use_container_width=True,
+                )
+            except Exception as exc:
+                col.warning(f"Could not render {entry['file_name']}: {exc}")
+
+
+_render_gallery(gallery)
+
+st.divider()
+
+# ─── Misclassification selector ───────────────────────────────────────────────
+
+st.subheader("Review & Correct Detections")
+
+with st.expander("Select misclassified / wrong bounding boxes", expanded=False):
+    st.markdown(
+        "Pick image + bbox combinations that were incorrectly detected. "
+        "Use the **bbox IDs** shown on each image card above (format `imgIndex-boxIndex`)."
+    )
+
+    # Build a flat lookup: bbox_id -> (entry, ann)
+    bbox_lookup: dict[str, tuple[dict, dict]] = {}
+    all_bbox_ids: list[str] = []
+    for entry in gallery:
+        for ann in entry["annotations"]:
+            bid = ann["bbox_id"]
+            bbox_lookup[bid] = (entry, ann)
+            all_bbox_ids.append(bid)
+
+    selected_wrong = st.multiselect(
+        "Wrong bbox IDs",
+        options=all_bbox_ids,
+        default=st.session_state.get("selected_wrong_bboxes", []),
+        format_func=lambda bid: (
+            f"{bid}  —  {bbox_lookup[bid][0]['file_name']}  "
+            f"bbox {bbox_lookup[bid][1]['bbox']}"
+        ),
+        key="wrong_bbox_multiselect",
+    )
+    st.session_state["selected_wrong_bboxes"] = selected_wrong
+
+    if selected_wrong:
+        st.info(f"{len(selected_wrong)} bbox(es) selected as wrong.")
+        st.markdown("**Preview of selected (highlighted in red):**")
+        # Show only the images that contain at least one selected bbox
+        affected_img_idxs = {bid.split("-")[0] for bid in selected_wrong}
+        highlighted_entries = [
+            e for e in gallery if str(e["img_idx"]) in affected_img_idxs
+        ]
+        _render_gallery(
+            highlighted_entries,
+            highlighted_bbox_ids=set(selected_wrong),
+            container_height=400,
+        )
+
+st.divider()
+
+# ─── Similarity search ────────────────────────────────────────────────────────
+
+st.subheader("Find Similar Objects (Visual Similarity Search)")
+st.caption(
+    "Uses a pretrained ViT-B/16 vision transformer to embed bounding-box crops "
+    "and retrieve visually similar detections across all images."
+)
+
+col_sim1, col_sim2 = st.columns([2, 1])
+with col_sim1:
+    top_k = st.slider("Max similar matches to return", 1, 50, 10)
+with col_sim2:
+    min_sim = st.slider("Minimum similarity threshold", 0.50, 1.00, 0.70, step=0.01)
+
+run_similarity = st.button(
+    "Search for Similar Objects",
+    disabled=not bool(st.session_state.get("selected_wrong_bboxes")),
+    help="Select wrong bbox IDs in the expander above first.",
+)
+
+if run_similarity:
+    wrong_ids: list[str] = st.session_state.get("selected_wrong_bboxes", [])
+    if not wrong_ids:
+        st.warning("No wrong bboxes selected.")
+    else:
+        with st.spinner("Computing embeddings…"):
+            # ── Build query crops from selected wrong bboxes ──────────────────
+            query_crops: list[Image.Image] = []
+            for bid in wrong_ids:
+                entry, ann = bbox_lookup[bid]
+                query_crops.append(crop_bbox(entry["image_path"], ann["bbox"]))
+
+            # ── Build candidate crops from ALL annotations ────────────────────
+            candidate_crops: list[Image.Image] = []
+            candidate_meta: list[dict[str, Any]] = []
+            for entry in gallery:
+                for ann in entry["annotations"]:
+                    candidate_crops.append(crop_bbox(entry["image_path"], ann["bbox"]))
+                    candidate_meta.append(
+                        {
+                            "bbox_id": ann["bbox_id"],
+                            "file_name": entry["file_name"],
+                            "image_path": str(entry["image_path"]),
+                            "img_idx": entry["img_idx"],
+                            "bbox": ann["bbox"],
+                            "ann_id": ann["id"],
+                            "image_id": entry["image_id"],
+                            "entry": entry,
+                            "ann": ann,
+                        }
+                    )
+
+            query_embs = embed_crops(query_crops)
+            cand_embs = embed_crops(candidate_crops)
+
+        matches = find_similar(
+            query_embs,
+            cand_embs,
+            candidate_meta,
+            top_k=top_k,
+            min_similarity=min_sim,
+        )
+        st.session_state["similarity_matches"] = matches
+        st.session_state["similarity_wrong_ids"] = set(wrong_ids)
+
+# Display similarity results if available
+if st.session_state.get("similarity_matches"):
+    matches: list[dict] = st.session_state["similarity_matches"]
+    wrong_set: set[str] = st.session_state.get("similarity_wrong_ids", set())
+
+    st.markdown(f"**{len(matches)} similar match(es) found:**")
+
+    # Group matches by image for gallery display
+    matched_entry_map: dict[int, dict] = {}
+    matched_ann_map: dict[int, list[dict]] = {}
+    for m in matches:
+        img_idx = m["img_idx"]
+        if img_idx not in matched_entry_map:
+            matched_entry_map[img_idx] = m["entry"]
+            matched_ann_map[img_idx] = []
+        matched_ann_map[img_idx].append(m["ann"])
+
+    # Synthesise gallery-like entries restricted to matching annotations
+    match_gallery: list[dict[str, Any]] = [
+        {**matched_entry_map[idx], "annotations": matched_ann_map[idx]}
+        for idx in sorted(matched_entry_map)
+    ]
+
+    _render_gallery(
+        match_gallery,
+        highlighted_bbox_ids={m["bbox_id"] for m in matches},
+        container_height=500,
+    )
+
+    # Tabular view
+    with st.expander("Match details table"):
+        df_matches = pd.DataFrame(
+            [
+                {
+                    "Similarity": f"{m['similarity']:.3f}",
+                    "bbox_id": m["bbox_id"],
+                    "Image": m["file_name"],
+                    "BBox [x,y,w,h]": m["bbox"],
+                }
+                for m in matches
+            ]
+        )
+        st.dataframe(df_matches, use_container_width=True, hide_index=True)
+
+    st.divider()
+
+    # ── Remove annotations button ─────────────────────────────────────────────
+    st.subheader("Remove Annotations from Dataset")
+
+    remove_options = {m["bbox_id"]: m for m in matches}
+    remove_options.update(
+        {
+            bid: {
+                "bbox_id": bid,
+                "ann_id": bbox_lookup[bid][1]["id"],
+                "image_id": bbox_lookup[bid][0]["image_id"],
+                "file_name": bbox_lookup[bid][0]["file_name"],
+            }
+            for bid in (st.session_state.get("selected_wrong_bboxes") or [])
+            if bid in bbox_lookup
+        }
+    )
+
+    to_remove = st.multiselect(
+        "Bbox IDs to remove from annotation JSON",
+        options=list(remove_options.keys()),
+        default=list(remove_options.keys()),
+        format_func=lambda bid: (
+            f"{bid}  —  {remove_options[bid].get('file_name', '?')}"
+        ),
+        key="remove_bbox_multiselect",
+    )
+
+    if to_remove:
+        remove_ann_ids = {
+            remove_options[bid]["ann_id"]
+            for bid in to_remove
+            if "ann_id" in remove_options.get(bid, {})
+        }
+        st.warning(
+            f"This will permanently remove {len(remove_ann_ids)} annotation(s) "
+            f"from `{output_json_path.name}`."
+        )
+
+    if st.button(
+        f"Remove {len(to_remove)} annotation(s)",
+        type="primary",
+        disabled=not bool(to_remove),
+    ):
+        _remove_annotations(output_json_path, remove_ann_ids)
+
+elif st.session_state.get("similarity_matches") == []:
+    st.info("No matches found above the similarity threshold.")
+
+# ─── Stand-alone remove (without running similarity search) ──────────────────
+
+wrong_ids_current: list[str] = st.session_state.get("selected_wrong_bboxes", [])
+if wrong_ids_current and not st.session_state.get("similarity_matches"):
+    st.divider()
+    st.subheader("Remove Selected Wrong Annotations")
+    wrong_ann_ids = {
+        bbox_lookup[bid][1]["id"]
+        for bid in wrong_ids_current
+        if bid in bbox_lookup
+    }
+    st.warning(
+        f"Remove {len(wrong_ann_ids)} selected wrong annotation(s) from "
+        f"`{output_json_path.name}` without running similarity search?"
+    )
+    if st.button(
+        f"Remove {len(wrong_ann_ids)} annotation(s)",
+        type="primary",
+        key="remove_wrong_only",
+    ):
+        _remove_annotations(output_json_path, wrong_ann_ids)
+
+
