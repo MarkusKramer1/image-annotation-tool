@@ -34,6 +34,7 @@ for _key in (
     "p3_prototypes",        # dict[int, int] — cluster_id -> index in ann_ids
     "p3_cluster_dataset",   # str — dataset name when clustering was run
     "p3_decisions",         # dict[str, str] — str(cluster_id) -> 'keep'|'discard'
+    "p3_cluster_names",     # dict[str, str] — str(cluster_id) -> precise label
     "p3_confirmed",         # bool
     "p3_selected_cats",     # list[str]
 ):
@@ -105,6 +106,47 @@ def _run_kmeans(embeddings: np.ndarray, n_clusters: int) -> np.ndarray:
     from sklearn.cluster import KMeans  # type: ignore
     km = KMeans(n_clusters=n_clusters, n_init="auto", random_state=42)
     return km.fit_predict(embeddings)
+
+
+def _load_cluster_crops(
+    cluster_id: int,
+    labels_arr: np.ndarray,
+    ann_ids_list: list[int],
+    filtered_ann_map: dict[int, dict],
+    img_map: dict[int, dict],
+    dataset_dir: Path,
+    max_crops: int = 60,
+    thumb_size: int = 120,
+) -> list[tuple[Image.Image, str]]:
+    """Return (thumbnail, caption) pairs for every annotation in *cluster_id*."""
+    results: list[tuple[Image.Image, str]] = []
+    for i, aid in enumerate(ann_ids_list):
+        if labels_arr[i] != cluster_id:
+            continue
+        ann = filtered_ann_map.get(aid)
+        if ann is None:
+            continue
+        img_info = img_map.get(ann["image_id"])
+        if img_info is None:
+            continue
+        img_path = dataset_dir / IMAGE_ROOT / img_info["file_name"]
+        if not img_path.exists():
+            continue
+        try:
+            pil = Image.open(img_path).convert("RGB")
+            x, y, w, h = ann["bbox"]
+            x1, y1 = max(0, int(x)), max(0, int(y))
+            x2, y2 = min(pil.width, int(x + w)), min(pil.height, int(y + h))
+            if x2 <= x1 or y2 <= y1:
+                continue
+            crop = pil.crop((x1, y1, x2, y2))
+            crop.thumbnail((thumb_size, thumb_size))
+            results.append((crop, img_info["file_name"]))
+        except Exception:
+            continue
+        if len(results) >= max_crops:
+            break
+    return results
 
 
 def _compute_prototypes(
@@ -360,8 +402,11 @@ else:
         st.session_state.p3_decisions = {
             str(cid): "keep" for cid in prototypes_map.keys()
         }
+    if st.session_state.p3_cluster_names is None:
+        st.session_state.p3_cluster_names = {}
 
     decisions: dict[str, str] = st.session_state.p3_decisions
+    cluster_names: dict[str, str] = st.session_state.p3_cluster_names
 
     cluster_ids = sorted(prototypes_map.keys())
     n_noise = int(np.sum(labels_arr == -1))
@@ -371,65 +416,121 @@ else:
             f"{n_noise} noise point(s) (HDBSCAN label -1) will be excluded from export."
         )
 
-    st.markdown("**Review each cluster — Keep or Discard:**")
+    # Gallery controls
+    ctrl_col1, ctrl_col2 = st.columns([1, 1])
+    with ctrl_col1:
+        max_gallery_crops: int = st.number_input(
+            "Max images shown per cluster",
+            min_value=4,
+            max_value=200,
+            value=20,
+            step=4,
+            help="Limits how many crop thumbnails are displayed per cluster.",
+        )
+    with ctrl_col2:
+        thumb_px: int = st.select_slider(
+            "Thumbnail size (px)",
+            options=[64, 96, 120, 160, 200],
+            value=120,
+        )
 
-    # Render in 2-column grid
-    grid_cols = st.columns(2)
+    st.markdown("**Review each cluster — assign a precise label, keep or discard:**")
 
-    for grid_i, cid in enumerate(cluster_ids):
-        col = grid_cols[grid_i % 2]
+    for cid in cluster_ids:
         proto_idx = prototypes_map[cid]
         proto_ann_id = ann_ids_list[proto_idx]
         proto_ann = filtered_ann_map.get(proto_ann_id)
         cluster_size = int(np.sum(labels_arr == cid))
         cat_name = cat_map.get(proto_ann.get("category_id", -1), "?") if proto_ann else "?"
+        current_decision = decisions.get(str(cid), "keep")
+        current_name = cluster_names.get(str(cid), "")
 
-        with col:
-            with st.container(border=True):
-                header_cols = st.columns([3, 1])
-                with header_cols[0]:
-                    st.markdown(f"**Cluster {cid}** · {cluster_size} items · `{cat_name}`")
+        status_icon = "✅" if current_decision == "keep" else "🗑️"
+        label_hint = f" → _{current_name}_" if current_name else ""
 
-                # Render prototype image
-                if proto_ann is not None:
-                    img_info = img_map.get(proto_ann["image_id"])
-                    if img_info:
-                        img_path = _image_path(dataset_dir, img_info)
-                        try:
-                            thumb = _crop_with_bbox_drawn(img_path, proto_ann["bbox"])
-                            st.image(thumb, use_container_width=True)
-                        except Exception as exc:
-                            st.warning(f"Could not render crop: {exc}")
-                    else:
-                        st.caption("(image not found)")
-                else:
-                    st.caption("(annotation not found)")
+        with st.expander(
+            f"{status_icon} **Cluster {cid}** · {cluster_size} item(s) · `{cat_name}`{label_hint}",
+            expanded=False,
+        ):
+            # ── Precise label input ─────────────────────────────────────────
+            new_name = st.text_input(
+                "Precise label",
+                value=current_name,
+                placeholder=f"e.g. Non-Flammable Gas Hazmat Sign",
+                key=f"cname_{cid}",
+                help=(
+                    "Assign a more specific class name to this cluster. "
+                    "Used as the category name on export. "
+                    "Leave blank to keep the original base-class name."
+                ),
+            )
+            if new_name != current_name:
+                st.session_state.p3_cluster_names[str(cid)] = new_name
+                st.session_state.p3_confirmed = None
 
-                # Keep / Discard toggle
-                current = decisions.get(str(cid), "keep")
-                btn_col1, btn_col2 = st.columns(2)
-                with btn_col1:
-                    keep_type = "primary" if current == "keep" else "secondary"
-                    if st.button(
-                        "Keep",
-                        key=f"keep_{cid}",
-                        type=keep_type,
-                        use_container_width=True,
-                    ):
-                        st.session_state.p3_decisions[str(cid)] = "keep"
-                        st.session_state.p3_confirmed = None
-                        st.rerun()
-                with btn_col2:
-                    discard_type = "primary" if current == "discard" else "secondary"
-                    if st.button(
-                        "Discard",
-                        key=f"discard_{cid}",
-                        type=discard_type,
-                        use_container_width=True,
-                    ):
-                        st.session_state.p3_decisions[str(cid)] = "discard"
-                        st.session_state.p3_confirmed = None
-                        st.rerun()
+            # ── Prototype image ─────────────────────────────────────────────
+            if proto_ann is not None:
+                img_info = img_map.get(proto_ann["image_id"])
+                if img_info:
+                    img_path = _image_path(dataset_dir, img_info)
+                    try:
+                        proto_thumb = _crop_with_bbox_drawn(img_path, proto_ann["bbox"], target_width=240)
+                        st.image(proto_thumb, caption="Prototype (cluster centroid)", width=240)
+                    except Exception as exc:
+                        st.warning(f"Could not render prototype: {exc}")
+
+            # ── Full image gallery ──────────────────────────────────────────
+            st.markdown(f"**All images in this cluster** (up to {max_gallery_crops}):")
+            crops = _load_cluster_crops(
+                cid,
+                labels_arr,
+                ann_ids_list,
+                filtered_ann_map,
+                img_map,
+                dataset_dir,
+                max_crops=max_gallery_crops,
+                thumb_size=thumb_px,
+            )
+            if not crops:
+                st.caption("No crops available.")
+            else:
+                cols_per_row = max(1, min(10, 800 // thumb_px))
+                rows = [crops[i : i + cols_per_row] for i in range(0, len(crops), cols_per_row)]
+                for row in rows:
+                    row_cols = st.columns(len(row))
+                    for rc, (thumb, fname) in zip(row_cols, row):
+                        rc.image(thumb, caption=fname, use_container_width=False)
+                if len(crops) == max_gallery_crops and cluster_size > max_gallery_crops:
+                    st.caption(
+                        f"Showing {max_gallery_crops} of {cluster_size} — "
+                        "increase 'Max images shown per cluster' to see more."
+                    )
+
+            # ── Keep / Discard buttons ──────────────────────────────────────
+            st.markdown("---")
+            btn_col1, btn_col2 = st.columns(2)
+            with btn_col1:
+                keep_type = "primary" if current_decision == "keep" else "secondary"
+                if st.button(
+                    "✅ Keep",
+                    key=f"keep_{cid}",
+                    type=keep_type,
+                    use_container_width=True,
+                ):
+                    st.session_state.p3_decisions[str(cid)] = "keep"
+                    st.session_state.p3_confirmed = None
+                    st.rerun()
+            with btn_col2:
+                discard_type = "primary" if current_decision == "discard" else "secondary"
+                if st.button(
+                    "🗑️ Discard",
+                    key=f"discard_{cid}",
+                    type=discard_type,
+                    use_container_width=True,
+                ):
+                    st.session_state.p3_decisions[str(cid)] = "discard"
+                    st.session_state.p3_confirmed = None
+                    st.rerun()
 
     st.divider()
 
@@ -461,39 +562,81 @@ else:
     labels_arr = st.session_state.p3_cluster_labels
     ann_ids_list = st.session_state.p3_ann_ids
     decisions = st.session_state.p3_decisions
+    cluster_names = st.session_state.p3_cluster_names or {}
     filtered_ann_map = {ann["id"]: ann for ann in filtered_anns}
 
     kept_cluster_ids = {int(cid) for cid, v in decisions.items() if v == "keep"}
 
-    # Determine which annotation IDs to keep
-    kept_ann_ids: set[int] = set()
+    # Determine which annotation IDs to keep and their cluster assignment
+    ann_id_to_cluster: dict[int, int] = {}
     for i, aid in enumerate(ann_ids_list):
         if labels_arr[i] in kept_cluster_ids:
-            kept_ann_ids.add(aid)
+            ann_id_to_cluster[aid] = int(labels_arr[i])
 
-    # Build COCO output from the original base_detection.json,
-    # restricting to filtered categories and kept annotation IDs.
-    kept_anns = [
-        ann for ann in coco.get("annotations", [])
-        if ann["id"] in kept_ann_ids
-    ]
+    kept_ann_ids: set[int] = set(ann_id_to_cluster.keys())
+
+    # ── Build precise-label categories ────────────────────────────────────────
+    # Each kept cluster that has a precise name becomes its own category.
+    # Clusters without a precise name fall back to the original base category.
+
+    # Collect original categories as a lookup
+    orig_cat_by_id: dict[int, dict] = {c["id"]: c for c in coco.get("categories", [])}
+
+    # Assign new category IDs for clusters that carry a precise name.
+    # We start from max(existing cat ids) + 1 to avoid conflicts.
+    existing_ids = [c["id"] for c in coco.get("categories", [])]
+    next_cat_id = max(existing_ids, default=0) + 1
+
+    cluster_to_cat_id: dict[int, int] = {}   # cluster_id -> new or existing cat id
+    new_categories: list[dict] = []
+    seen_cat_ids: set[int] = set()
+
+    for cid in sorted(kept_cluster_ids):
+        precise = cluster_names.get(str(cid), "").strip()
+        if precise:
+            # New precise category
+            new_cat = {"id": next_cat_id, "name": precise, "supercategory": ""}
+            new_categories.append(new_cat)
+            cluster_to_cat_id[cid] = next_cat_id
+            next_cat_id += 1
+        else:
+            # Find original category from prototype annotation
+            proto_idx = st.session_state.p3_prototypes.get(cid)
+            proto_ann = filtered_ann_map.get(ann_ids_list[proto_idx]) if proto_idx is not None else None
+            orig_cat_id = proto_ann.get("category_id") if proto_ann else None
+            if orig_cat_id and orig_cat_id in orig_cat_by_id:
+                cluster_to_cat_id[cid] = orig_cat_id
+                if orig_cat_id not in seen_cat_ids:
+                    new_categories.append(orig_cat_by_id[orig_cat_id])
+                    seen_cat_ids.add(orig_cat_id)
+            # else: skip (no category to assign)
+
+    # Rebuild annotations with updated category_id
+    kept_anns = []
+    for ann in coco.get("annotations", []):
+        if ann["id"] not in kept_ann_ids:
+            continue
+        cluster_id = ann_id_to_cluster[ann["id"]]
+        new_cat_id = cluster_to_cat_id.get(cluster_id)
+        if new_cat_id is None:
+            continue
+        ann_copy = dict(ann)
+        ann_copy["category_id"] = new_cat_id
+        kept_anns.append(ann_copy)
 
     # Keep only images that have at least one retained annotation
     kept_image_ids = {ann["image_id"] for ann in kept_anns}
     kept_images = [img for img in coco.get("images", []) if img["id"] in kept_image_ids]
 
-    # Keep only relevant categories
-    kept_categories = [c for c in coco.get("categories", []) if c["id"] in selected_cat_ids]
-
     exact_coco: dict[str, Any] = {
         "info": {
             **(coco.get("info") or {}),
-            "description": "Exact-class detection (post-clustering)",
+            "description": "Exact-class detection (post-clustering, precise labels)",
         },
         "licenses": coco.get("licenses", []),
         "images": kept_images,
         "annotations": kept_anns,
-        "categories": kept_categories,
+        "categories": new_categories,
     }
 
     out_path = dataset_dir / "annotations" / "exact_detection.json"
@@ -520,6 +663,7 @@ else:
     # Stats
     before_count = len(ann_map)
     after_count = len(kept_anns)
+    n_precise = sum(1 for cid in kept_cluster_ids if cluster_names.get(str(cid), "").strip())
     st.markdown(
         f"**Stats:** {before_count} annotations in base → "
         f"**{after_count}** kept after clustering "
@@ -528,5 +672,21 @@ else:
     )
     st.markdown(
         f"Images: {len(img_map)} → **{len(kept_images)}** with annotations. "
-        f"Categories: {len(kept_categories)}."
+        f"Categories: **{len(new_categories)}** "
+        f"({n_precise} with precise labels, {len(new_categories) - n_precise} using original names)."
     )
+
+    # Label mapping preview
+    if cluster_names:
+        named = {cid: name for cid, name in cluster_names.items() if name.strip()}
+        if named:
+            with st.expander("Precise label assignments", expanded=False):
+                import pandas as pd
+                rows = []
+                for cid_str, name in sorted(named.items(), key=lambda x: int(x[0])):
+                    cid_int = int(cid_str)
+                    proto_idx = st.session_state.p3_prototypes.get(cid_int)
+                    proto_ann = filtered_ann_map.get(ann_ids_list[proto_idx]) if proto_idx is not None else None
+                    orig = cat_map.get(proto_ann.get("category_id", -1), "?") if proto_ann else "?"
+                    rows.append({"Cluster": cid_int, "Original class": orig, "Precise label": name})
+                st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
