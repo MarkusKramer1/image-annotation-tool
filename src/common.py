@@ -9,6 +9,10 @@ PROJECT_ROOT = Path(__file__).parent.parent.resolve()
 WEDETECT_DIR = PROJECT_ROOT / "WeDetect"
 DATA_DIR = PROJECT_ROOT / "data"
 
+# Path to the few-shot-object-detection package (YOLO-E backend).
+# Override via the UI text input if yours lives elsewhere.
+FSDET_DIR = Path.home() / "hector" / "src" / "few-shot-object-detection"
+
 TEST_VIDEO_PATH = Path.home() / "Videos" / "athena_driving3.mp4"
 TEST_DATASET_NAME = "athena_driving3_test"
 

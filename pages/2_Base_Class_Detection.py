@@ -19,6 +19,7 @@ from PIL import Image
 from src.common import (
     CONFIG_MAP,
     DATA_DIR,
+    FSDET_DIR,
     IMAGE_ROOT,
     PROJECT_ROOT,
     TEST_DATASET_NAME,
@@ -36,6 +37,12 @@ from src.detection_gallery import (
 )
 from src.similarity_search import embed_crops, find_similar
 
+try:
+    from streamlit_image_coordinates import streamlit_image_coordinates as _sic
+    _SIC_AVAILABLE = True
+except ImportError:
+    _SIC_AVAILABLE = False
+
 # ── WeDetect-Uni checkpoint config ────────────────────────────────────────────
 UNI_CHECKPOINT_NAMES = {
     "base":  "checkpoints/wedetect_base_uni.pth",
@@ -49,6 +56,24 @@ if "gallery_ready_dataset" not in st.session_state:
 
 
 # ─── Gallery helpers (defined early so _remove_annotations can reference them) ─
+
+@st.cache_data(show_spinner=False)
+def _load_frame_display(image_path: str, display_w: int) -> tuple[bytes, int, int]:
+    """Load a frame, resize to display_w, and return (jpeg_bytes, orig_w, orig_h).
+
+    Cached so repeated reruns (e.g. while drawing a bbox) skip the disk I/O and
+    resize completely.  Returns JPEG bytes so the caller can draw overlays on a
+    decoded copy without re-encoding the base image each time.
+    """
+    import io as _io
+    img = Image.open(image_path).convert("RGB")
+    orig_w, orig_h = img.size
+    display_h = max(1, round(orig_h * display_w / orig_w))
+    img_small = img.resize((display_w, display_h), Image.LANCZOS)
+    buf = _io.BytesIO()
+    img_small.save(buf, format="JPEG", quality=80)
+    return buf.getvalue(), orig_w, orig_h
+
 
 @st.cache_data(show_spinner=False)
 def _load_gallery(ann_path: str, images_dir: str, file_sig: float) -> list[dict[str, Any]]:
@@ -326,101 +351,487 @@ st.divider()
 # ─── 1. Object Detection ──────────────────────────────────────────────────────
 
 with st.expander("1. Object Detection", expanded=True):
-    col_left, col_right = st.columns(2)
 
-    with col_left:
-        model_size = st.radio(
-            "Model size",
-            options=["tiny", "base", "large"],
-            index=1,
-            horizontal=True,
-        )
-        st.caption(
-            f"Config: `{CONFIG_MAP[model_size][0]}`  |  "
-            f"Checkpoint: `{CONFIG_MAP[model_size][1]}`"
-        )
-
-    with col_right:
-        adaptive_threshold = st.checkbox(
-            "Adaptive per-class threshold",
-            value=True,
-            help=(
-                "After the global confidence threshold, keep only detections that "
-                "score within a ratio of the best detection for their class."
-            ),
-        )
-        threshold = st.slider(
-            "Confidence threshold",
-            min_value=0.01,
-            max_value=0.90,
-            value=0.01 if adaptive_threshold else 0.30,
-            step=0.01,
-        )
-        adaptive_threshold_ratio = st.slider(
-            "Adaptive threshold ratio",
-            min_value=0.50,
-            max_value=1.00,
-            value=0.90,
-            step=0.10,
-            disabled=not adaptive_threshold,
-        )
-        topk = st.number_input(
-            "Max detections per frame",
-            min_value=1,
-            max_value=500,
-            value=100,
-            step=10,
-        )
-
-    if is_test_mode:
-        _default_classes = "robot"
-    elif _existing_classes:
-        _default_classes = ", ".join(_existing_classes)
-    else:
-        _default_classes = ""
-
-    classes_input = st.text_input(
-        "Object classes (comma-separated)",
-        value=_default_classes,
-        placeholder="screw,nut,flange",
+    # ── Mode selector ─────────────────────────────────────────────────────────
+    detect_mode = st.radio(
+        "Detection mode",
+        options=["Text prompts", "Visual prompts"],
+        horizontal=True,
+        key="detect_mode",
+        help=(
+            "**Text prompts** — describe what to find with class names (e.g. *robot, screw*). "
+            "Uses WeDetect open-vocabulary detection.  \n"
+            "**Visual prompts** — draw example bounding boxes on frames to show what to find. "
+            "Uses WeDetect-Uni visual similarity matching."
+        ),
     )
-    if classes_input.strip():
-        parsed = [c.strip() for c in classes_input.split(",") if c.strip()]
-        st.caption(f"{len(parsed)} class(es): {', '.join(f'`{c}`' for c in parsed)}")
-
     st.divider()
 
-    if not WEDETECT_DIR.exists():
-        st.error(
-            f"WeDetect directory not found at `{WEDETECT_DIR}`. "
-            "Make sure the WeDetect/ folder is present in the project root."
+    # ══════════════════════════════════════════════════════════════════════════
+    # TEXT PROMPT MODE
+    # ══════════════════════════════════════════════════════════════════════════
+    if detect_mode == "Text prompts":
+
+        col_left, col_right = st.columns(2)
+
+        with col_left:
+            model_size = st.radio(
+                "Model size",
+                options=["tiny", "base", "large"],
+                index=1,
+                horizontal=True,
+            )
+            st.caption(
+                f"Config: `{CONFIG_MAP[model_size][0]}`  |  "
+                f"Checkpoint: `{CONFIG_MAP[model_size][1]}`"
+            )
+
+        with col_right:
+            adaptive_threshold = st.checkbox(
+                "Adaptive per-class threshold",
+                value=True,
+                help=(
+                    "After the global confidence threshold, keep only detections that "
+                    "score within a ratio of the best detection for their class."
+                ),
+            )
+            threshold = st.slider(
+                "Confidence threshold",
+                min_value=0.01,
+                max_value=0.90,
+                value=0.01 if adaptive_threshold else 0.30,
+                step=0.01,
+            )
+            adaptive_threshold_ratio = st.slider(
+                "Adaptive threshold ratio",
+                min_value=0.50,
+                max_value=1.00,
+                value=0.90,
+                step=0.10,
+                disabled=not adaptive_threshold,
+            )
+            topk = st.number_input(
+                "Max detections per frame",
+                min_value=1,
+                max_value=500,
+                value=100,
+                step=10,
+            )
+
+        if is_test_mode:
+            _default_classes = "robot"
+        elif _existing_classes:
+            _default_classes = ", ".join(_existing_classes)
+        else:
+            _default_classes = ""
+
+        classes_input = st.text_input(
+            "Object classes (comma-separated)",
+            value=_default_classes,
+            placeholder="screw,nut,flange",
         )
-        st.stop()
+        if classes_input.strip():
+            parsed = [c.strip() for c in classes_input.split(",") if c.strip()]
+            st.caption(f"{len(parsed)} class(es): {', '.join(f'`{c}`' for c in parsed)}")
 
-    checkpoint_path = WEDETECT_DIR / CONFIG_MAP[model_size][1]
-    if not checkpoint_path.exists():
-        st.error(
-            f"Checkpoint `{checkpoint_path.name}` not found. "
-            "Download the model weights into `WeDetect/checkpoints/`."
+        st.divider()
+
+        if not WEDETECT_DIR.exists():
+            st.error(
+                f"WeDetect directory not found at `{WEDETECT_DIR}`. "
+                "Make sure the WeDetect/ folder is present in the project root."
+            )
+            st.stop()
+
+        checkpoint_path = WEDETECT_DIR / CONFIG_MAP[model_size][1]
+        if not checkpoint_path.exists():
+            st.error(
+                f"Checkpoint `{checkpoint_path.name}` not found. "
+                "Download the model weights into `WeDetect/checkpoints/`."
+            )
+            st.stop()
+
+        can_run = bool(classes_input.strip())
+
+        run_clicked = st.button(
+            "Run Detection",
+            type="primary",
+            disabled=not can_run,
         )
-        st.stop()
 
-    can_run = bool(classes_input.strip())
+        if not can_run and not run_clicked:
+            st.info("Please provide at least one class name to continue.")
 
-    run_clicked = st.button(
-        "Run Detection",
-        type="primary",
-        disabled=not can_run,
-    )
+    # ══════════════════════════════════════════════════════════════════════════
+    # VISUAL PROMPT MODE
+    # ══════════════════════════════════════════════════════════════════════════
+    else:
+        st.caption(
+            "Draw bounding boxes on example frames to define *what* to detect. "
+            "The selected backend will search for visually similar objects across all frames."
+        )
 
-    if not can_run and not run_clicked:
-        st.info("Please provide at least one class name to continue.")
+        # ── Backend selector ──────────────────────────────────────────────────
+        _vp_backend = st.radio(
+            "Detection backend",
+            options=["WeDetect-Uni", "YOLO-E"],
+            horizontal=True,
+            key="vp_backend",
+            help=(
+                "**WeDetect-Uni** — embedding-based proposal matching (cosine similarity).  \n"
+                "**YOLO-E** — few-shot segmentation model; directly runs YOLO-E inference "
+                "with visual prototype embeddings."
+            ),
+        )
+
+        if not _SIC_AVAILABLE:
+            st.error(
+                "`streamlit-image-coordinates` is not installed. "
+                "Run: `pip install streamlit-image-coordinates` in the project environment."
+            )
+
+        # ── Frame selector ────────────────────────────────────────────────────
+        _vp_frame_files = sorted(
+            [p for p in frames_dir.iterdir()
+             if p.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"}],
+            key=lambda p: p.name,
+        )
+        _vp_frame_names = [f.name for f in _vp_frame_files]
+
+        if not _vp_frame_files:
+            st.warning("No frames found in this dataset yet.")
+        else:
+            _vp_fc1, _vp_fc2 = st.columns([2, 1])
+            with _vp_fc1:
+                _sel_frame_name = st.selectbox(
+                    "Select reference frame",
+                    options=_vp_frame_names,
+                    key="vp_frame_select",
+                )
+            with _vp_fc2:
+                st.markdown("&nbsp;", unsafe_allow_html=True)
+                st.caption(
+                    "**Click and drag** on the image to draw a bounding box around one example object."
+                )
+
+            _sel_frame_path = frames_dir / _sel_frame_name
+
+            # Fixed display width — all coordinates are in this pixel space.
+            _vp_display_w = 700
+
+            # Cached load+resize: disk I/O + resize only on first view of each frame.
+            _vp_jpeg_bytes, _vp_iw, _vp_ih = _load_frame_display(
+                str(_sel_frame_path), _vp_display_w
+            )
+
+            # Reset stored drag when the user switches to a different frame.
+            if st.session_state.get("vp_coords_frame") != _sel_frame_name:
+                st.session_state.pop("vp_last_drag", None)
+                st.session_state["vp_coords_frame"] = _sel_frame_name
+
+            if "vp_img_key" not in st.session_state:
+                st.session_state.vp_img_key = 0
+
+            # ── Click-and-drag image widget ───────────────────────────────────
+            # If a box was already drawn, overlay it on the cached display image
+            # so only one image is shown.  Drawing the box on the small
+            # (700-px-wide) copy is cheap; no full-res re-encode needed.
+            _last_drag = st.session_state.get("vp_last_drag")
+
+            # Decode cached JPEG bytes into a PIL Image (small / fast).
+            import io as _io2
+            _sic_source = Image.open(_io2.BytesIO(_vp_jpeg_bytes)).convert("RGB")
+
+            if _last_drag:
+                # Overlay the stored bbox on the display-sized image.
+                _px1 = round(min(_last_drag["x1"], _last_drag["x2"]))
+                _py1 = round(min(_last_drag["y1"], _last_drag["y2"]))
+                _px2 = round(max(_last_drag["x1"], _last_drag["x2"]))
+                _py2 = round(max(_last_drag["y1"], _last_drag["y2"]))
+                _pbw = max(1, _px2 - _px1)
+                _pbh = max(1, _py2 - _py1)
+                from PIL import ImageDraw as _ImageDraw
+                _ImageDraw.Draw(_sic_source).rectangle(
+                    [_px1, _py1, _px2, _py2], outline=(255, 50, 50), width=3
+                )
+
+            if _SIC_AVAILABLE:
+                _drag = _sic(
+                    _sic_source,
+                    click_and_drag=True,
+                    cursor="crosshair",
+                    image_format="JPEG",
+                    jpeg_quality=80,
+                    key=f"vp_sic_{st.session_state.vp_img_key}",
+                )
+                if _drag is not None:
+                    st.session_state.vp_last_drag = _drag
+                    _last_drag = _drag
+                    _px1 = round(min(_drag["x1"], _drag["x2"]))
+                    _py1 = round(min(_drag["y1"], _drag["y2"]))
+                    _px2 = round(max(_drag["x1"], _drag["x2"]))
+                    _py2 = round(max(_drag["y1"], _drag["y2"]))
+                    _pbw = max(1, _px2 - _px1)
+                    _pbh = max(1, _py2 - _py1)
+            else:
+                _drag = None
+
+            if _last_drag:
+                # Convert display coords → original image coords for the caption
+                _scale = _vp_iw / _vp_display_w
+                st.caption(
+                    f"Box (original px) — x={round(_px1*_scale)} y={round(_py1*_scale)} "
+                    f"w={round(_pbw*_scale)} h={round(_pbh*_scale)} · drag again to replace"
+                )
+
+            # ── Label + Add button ────────────────────────────────────────────
+            _add_col1, _add_col2 = st.columns([4, 1])
+            with _add_col1:
+                _vp_label = st.text_input(
+                    "Label for this prompt",
+                    key="vp_label_input",
+                    placeholder="e.g. robot",
+                )
+            with _add_col2:
+                st.markdown("&nbsp;", unsafe_allow_html=True)
+                _add_vp_clicked = st.button(
+                    "Add",
+                    key="vp_add_btn",
+                    use_container_width=True,
+                    disabled=not (_SIC_AVAILABLE and _last_drag is not None and bool(_vp_label.strip())),
+                )
+
+            if _add_vp_clicked:
+                if not _vp_label.strip():
+                    st.warning("Please enter a label before adding.")
+                elif not _last_drag:
+                    st.warning("Please draw a bounding box first.")
+                else:
+                    # Scale display-space coords → original image coords
+                    _ascale = _vp_iw / _vp_display_w
+                    _fx1 = round(min(_last_drag["x1"], _last_drag["x2"]) * _ascale)
+                    _fy1 = round(min(_last_drag["y1"], _last_drag["y2"]) * _ascale)
+                    _fx2 = round(max(_last_drag["x1"], _last_drag["x2"]) * _ascale)
+                    _fy2 = round(max(_last_drag["y1"], _last_drag["y2"]) * _ascale)
+
+                    if "visual_prompts" not in st.session_state:
+                        st.session_state.visual_prompts = []
+
+                    st.session_state.visual_prompts.append({
+                        "image_name": _sel_frame_name,
+                        "image_path": str(_sel_frame_path),
+                        "bbox":       [_fx1, _fy1, max(1, _fx2 - _fx1), max(1, _fy2 - _fy1)],
+                        "label":      _vp_label.strip(),
+                    })
+                    # Reset for next prompt
+                    st.session_state.pop("vp_last_drag", None)
+                    st.session_state.vp_img_key += 1
+                    st.rerun()
+
+        # ── Visual prompts list ───────────────────────────────────────────────
+        if "visual_prompts" not in st.session_state:
+            st.session_state.visual_prompts = []
+
+        _vp_list: list[dict] = st.session_state.visual_prompts
+        if _vp_list:
+            st.markdown(f"**{len(_vp_list)} visual prompt(s)**")
+            _del_idx: int | None = None
+            for _vi, _vp in enumerate(_vp_list):
+                _vp_c1, _vp_c2, _vp_c3 = st.columns([1, 5, 1])
+                with _vp_c1:
+                    try:
+                        _vp_img = Image.open(_vp["image_path"]).convert("RGB")
+                        _vx, _vy, _vw, _vh = _vp["bbox"]
+                        _vp_crop = _vp_img.crop((
+                            max(0, _vx - 4), max(0, _vy - 4),
+                            min(_vp_img.width,  _vx + _vw + 4),
+                            min(_vp_img.height, _vy + _vh + 4),
+                        ))
+                        _vp_crop.thumbnail((80, 80), Image.LANCZOS)
+                        st.image(_vp_crop, width=80)
+                    except Exception:
+                        st.markdown("⬛")
+                with _vp_c2:
+                    st.markdown(
+                        f"**{_vp['label']}** &nbsp;·&nbsp; `{_vp['image_name']}` &nbsp;·&nbsp; "
+                        f"bbox `{_vp['bbox']}`",
+                        unsafe_allow_html=True,
+                    )
+                with _vp_c3:
+                    if st.button("✕", key=f"del_vp_{_vi}", help="Remove this prompt"):
+                        _del_idx = _vi
+
+            if _del_idx is not None:
+                st.session_state.visual_prompts.pop(_del_idx)
+                st.rerun()
+        else:
+            st.info("No visual prompts yet — draw a bounding box above and click **Add**.")
+
+        st.divider()
+
+        # ── Backend-specific parameters ────────────────────────────────────────
+        if _vp_backend == "WeDetect-Uni":
+            st.markdown("**WeDetect-Uni parameters**")
+            _vp_pc1, _vp_pc2 = st.columns([1, 2])
+            with _vp_pc1:
+                _vp_uni_size = st.radio(
+                    "Model size",
+                    options=["base", "large"],
+                    index=0,
+                    horizontal=True,
+                    key="vp_uni_size",
+                )
+            _vp_default_ckpt = str(WEDETECT_DIR / UNI_CHECKPOINT_NAMES[_vp_uni_size])
+            with _vp_pc2:
+                _vp_ckpt_input = st.text_input(
+                    "Checkpoint path",
+                    value=_vp_default_ckpt,
+                    key="vp_uni_checkpoint",
+                    help="Path to wedetect_base_uni.pth or wedetect_large_uni.pth",
+                )
+
+            _vp_ckpt_path = Path(_vp_ckpt_input.strip())
+            if not _vp_ckpt_path.exists():
+                st.warning(
+                    f"Checkpoint `{_vp_ckpt_path.name}` not found. "
+                    "Download **WeDetect-Base-Uni** or **WeDetect-Large-Uni** from "
+                    "[fushh7/WeDetect](https://huggingface.co/fushh7/WeDetect) "
+                    "and place it in `WeDetect/checkpoints/`."
+                )
+
+            _vp_param_c1, _vp_param_c2, _vp_param_c3, _vp_param_c4 = st.columns(4)
+            with _vp_param_c1:
+                _vp_topk = st.slider(
+                    "Top-K matches",
+                    min_value=5, max_value=500, value=100, step=5,
+                    key="vp_topk",
+                    help="Maximum total detections to keep (sorted by similarity).",
+                )
+            with _vp_param_c2:
+                _vp_min_sim = st.slider(
+                    "Min similarity",
+                    min_value=0.50, max_value=1.00, value=0.75, step=0.01,
+                    key="vp_min_sim",
+                    help="Cosine similarity threshold — higher = stricter.",
+                )
+            with _vp_param_c3:
+                _vp_score_thr = st.slider(
+                    "Proposal score threshold",
+                    min_value=0.00, max_value=0.50, value=0.00, step=0.01,
+                    key="vp_score_thr",
+                    help="WeDetect-Uni objectness score threshold for candidate proposals.",
+                )
+            with _vp_param_c4:
+                _vp_max_overlap = st.slider(
+                    "Max overlap (dedup)",
+                    min_value=0.00, max_value=0.90, value=0.30, step=0.05,
+                    key="vp_max_overlap",
+                    help=(
+                        "Proposals with IoU ≥ this threshold against existing annotations "
+                        "are excluded. Set to 0 to disable."
+                    ),
+                )
+
+            _vp_backend_ready = _vp_ckpt_path.exists()
+
+        else:  # YOLO-E
+            st.markdown("**YOLO-E parameters**")
+            _yoloe_pc1, _yoloe_pc2 = st.columns([1, 2])
+            with _yoloe_pc1:
+                _yoloe_model_size = st.radio(
+                    "Model size",
+                    options=["small", "medium", "large"],
+                    index=0,
+                    horizontal=True,
+                    key="vp_yoloe_size",
+                    help="small=yoloe-11s, medium=yoloe-11m, large=yoloe-11l",
+                )
+            with _yoloe_pc2:
+                _yoloe_fsdet_input = st.text_input(
+                    "YOLO-E package dir",
+                    value=str(FSDET_DIR),
+                    key="vp_yoloe_fsdet_dir",
+                    help="Path to the few-shot-object-detection package root.",
+                )
+
+            _yoloe_fsdet_path = Path(_yoloe_fsdet_input.strip())
+            _yoloe_pkg_ok = (_yoloe_fsdet_path / "few_shot_object_detection").is_dir()
+            if not _yoloe_pkg_ok:
+                st.warning(
+                    f"`few_shot_object_detection` package not found at "
+                    f"`{_yoloe_fsdet_path}`. "
+                    "Point to the root of the `few-shot-object-detection` repository."
+                )
+
+            _yoloe_p1, _yoloe_p2, _yoloe_p3, _yoloe_p4 = st.columns(4)
+            with _yoloe_p1:
+                _yoloe_conf = st.slider(
+                    "Confidence threshold",
+                    min_value=0.05, max_value=0.90, value=0.25, step=0.05,
+                    key="vp_yoloe_conf",
+                    help="YOLO-E detection confidence threshold.",
+                )
+            with _yoloe_p2:
+                _yoloe_nms = st.checkbox(
+                    "Apply NMS",
+                    value=True,
+                    key="vp_yoloe_nms",
+                    help="Per-class non-maximum suppression.",
+                )
+            with _yoloe_p3:
+                _yoloe_nms_iou = st.slider(
+                    "NMS IoU threshold",
+                    min_value=0.10, max_value=0.90, value=0.50, step=0.05,
+                    key="vp_yoloe_nms_iou",
+                    disabled=not _yoloe_nms,
+                )
+            with _yoloe_p4:
+                _vp_max_overlap = st.slider(
+                    "Max overlap (dedup)",
+                    min_value=0.00, max_value=0.90, value=0.30, step=0.05,
+                    key="vp_yoloe_max_overlap",
+                    help=(
+                        "Detections with IoU ≥ this against existing annotations "
+                        "are excluded. Set to 0 to disable."
+                    ),
+                )
+
+            _vp_backend_ready = _yoloe_pkg_ok
+
+        can_run = False  # text mode variable — not used in visual mode
+        run_clicked = False
+
+        can_run_visual = (
+            _SIC_AVAILABLE
+            and bool(_vp_list)
+            and _vp_backend_ready
+        )
+
+        run_visual_clicked = st.button(
+            "Run Visual Detection",
+            type="primary",
+            disabled=not can_run_visual,
+            key="run_visual_detection_btn",
+        )
+
+        if not can_run_visual and not run_visual_clicked:
+            if not _SIC_AVAILABLE:
+                st.info("Install `streamlit-image-coordinates` to enable visual detection.")
+            elif not _vp_list:
+                st.info("Add at least one visual prompt above to enable detection.")
+            elif not _vp_backend_ready:
+                if _vp_backend == "WeDetect-Uni":
+                    st.info("Provide a valid WeDetect-Uni checkpoint to enable detection.")
+                else:
+                    st.info("Point to a valid `few-shot-object-detection` package directory.")
 
     # ── Detection pipeline ────────────────────────────────────────────────────
     _pending_key = f"pending_detection_{selected_dataset}"
-    should_run = run_clicked or (is_test_mode and test_clicked)
+    should_run_text   = detect_mode == "Text prompts"   and (run_clicked or (is_test_mode and test_clicked))
+    should_run_visual = detect_mode == "Visual prompts" and run_visual_clicked
 
-    if should_run and can_run:
+    # ── TEXT detection pipeline ───────────────────────────────────────────────
+    if should_run_text and can_run:
         ann_dir = dataset_dir / "annotations"
         vis_dir = dataset_dir / "_vis"
         pending_json = ann_dir / "base_detection_pending.json"
@@ -536,7 +947,6 @@ with st.expander("1. Object Detection", expanded=True):
                 "pending_path": str(pending_json),
                 "done_data": done_data,
             }
-            # No st.rerun() — keep thumbnails visible and render Apply section below
         else:
             det_progress.empty()
             thumbnails_placeholder.empty()
@@ -546,7 +956,165 @@ with st.expander("1. Object Detection", expanded=True):
             with st.expander("Process output / errors"):
                 st.code("\n".join(stderr_lines[-200:]), language=None)
 
-    # ── Pending detection results ─────────────────────────────────────────────
+    # ── VISUAL detection pipeline ─────────────────────────────────────────────
+    elif should_run_visual:
+        import tempfile
+
+        ann_dir = dataset_dir / "annotations"
+        ann_dir.mkdir(parents=True, exist_ok=True)
+        pending_json = ann_dir / "base_detection_pending.json"
+
+        # Write visual prompts to a temporary JSON file
+        _vq_fd, _vq_path = tempfile.mkstemp(suffix=".json", prefix="visual_prompts_")
+        try:
+            with os.fdopen(_vq_fd, "w") as _vq_fh:
+                json.dump(st.session_state.visual_prompts, _vq_fh)
+
+            _backend_label = st.session_state.get("vp_backend", "WeDetect-Uni")
+            vp_status = st.empty()
+            vp_status.info(f"Launching {_backend_label} for visual prompt detection…")
+
+            vp_vis_dir = dataset_dir / "_vis_visual"
+            vp_runner = str(PROJECT_ROOT / "src" / "visual_detection_runner.py")
+
+            # Shared base command
+            vp_cmd = [
+                sys.executable,
+                vp_runner,
+                "--query-json",  _vq_path,
+                "--images-dir",  str(frames_dir),
+                "--output-json", str(pending_json),
+                "--image-root",  IMAGE_ROOT,
+                "--vis-dir",     str(vp_vis_dir),
+            ]
+
+            if _backend_label == "WeDetect-Uni":
+                vp_cmd += [
+                    "--backend",         "wedetect",
+                    "--wedetect-dir",    str(WEDETECT_DIR),
+                    "--uni-checkpoint",  str(_vp_ckpt_path),
+                    "--top-k",           str(_vp_topk),
+                    "--min-similarity",  str(_vp_min_sim),
+                    "--score-threshold", str(_vp_score_thr),
+                    "--max-overlap",     str(_vp_max_overlap),
+                ]
+                if output_json_path.exists() and _vp_max_overlap > 0:
+                    vp_cmd += ["--annotation-json", str(output_json_path)]
+            else:  # YOLO-E
+                vp_cmd += [
+                    "--backend",          "yoloe",
+                    "--fsdet-dir",        str(_yoloe_fsdet_path),
+                    "--yoloe-model-size", _yoloe_model_size,
+                    "--yoloe-confidence", str(_yoloe_conf),
+                    "--yoloe-nms-iou",    str(_yoloe_nms_iou),
+                    "--max-overlap",      str(_vp_max_overlap),
+                ]
+                if _yoloe_nms:
+                    vp_cmd.append("--yoloe-nms")
+                if output_json_path.exists() and _vp_max_overlap > 0:
+                    vp_cmd += ["--annotation-json", str(output_json_path)]
+
+            clean_env = os.environ.copy()
+            clean_env.pop("PYTHONPATH", None)
+            clean_env.pop("PYTHONSTARTUP", None)
+            clean_env.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+            clean_env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
+            vp_proc = subprocess.Popen(
+                vp_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+                env=clean_env,
+            )
+
+            vp_stderr_lines: list[str] = []
+
+            def _read_vp_stderr() -> None:
+                for line in vp_proc.stderr:
+                    vp_stderr_lines.append(line.rstrip())
+
+            vp_stderr_thread = threading.Thread(target=_read_vp_stderr, daemon=True)
+            vp_stderr_thread.start()
+
+            vp_progress = st.progress(0.0, text="Waiting for model to load…")
+            vp_thumbnails_placeholder = st.empty()
+            vp_done_data: dict | None = None
+
+            for raw_line in vp_proc.stdout:
+                line = raw_line.strip()
+                if not line:
+                    continue
+                try:
+                    data = json.loads(line)
+                except json.JSONDecodeError:
+                    vp_status.text(line)
+                    continue
+
+                msg_type = data.get("type")
+
+                if msg_type == "log":
+                    vp_status.info(data["msg"])
+
+                elif msg_type == "frame":
+                    frac = data["done"] / max(data["total"], 1)
+                    vp_progress.progress(
+                        frac,
+                        text=(
+                            f"Frame {data['done']}/{data['total']} · "
+                            f"{data.get('n_props', 0)} proposals · "
+                            f"{data.get('n_candidates', 0)} candidates"
+                        ),
+                    )
+
+                elif msg_type == "done":
+                    vp_done_data = data
+
+                elif msg_type == "error":
+                    st.error(data["msg"])
+
+            vp_proc.wait()
+            vp_stderr_thread.join(timeout=3.0)
+            vp_status.empty()
+
+            if vp_done_data:
+                vp_progress.progress(
+                    1.0,
+                    text="Visual detection complete — review and click Apply.",
+                )
+                # Show detection thumbnails (same layout as text prompt mode)
+                _vp_vis_entries = vp_done_data.get("vis_entries", [])
+                if _vp_vis_entries:
+                    with vp_thumbnails_placeholder.container(height=450):
+                        _vp_thumb_cols = st.columns(4)
+                        for _vi, _ve in enumerate(_vp_vis_entries):
+                            _vp_thumb_cols[_vi % 4].image(
+                                _ve["vis_path"],
+                                caption=f"{_ve['frame_name']} · {_ve['n_det']} det",
+                                use_container_width=True,
+                            )
+
+                st.session_state[_pending_key] = {
+                    "pending_path": str(pending_json),
+                    "done_data":    vp_done_data,
+                }
+            else:
+                vp_progress.empty()
+                vp_thumbnails_placeholder.empty()
+                st.warning("Visual detection ended without a completion message.")
+
+            if vp_stderr_lines:
+                with st.expander("Process output / errors"):
+                    st.code("\n".join(vp_stderr_lines[-200:]), language=None)
+
+        finally:
+            try:
+                os.unlink(_vq_path)
+            except OSError:
+                pass
+
+    # ── Pending detection results (shared by both modes) ──────────────────────
     _pending = st.session_state.get(_pending_key)
     if _pending:
         _pending_path = Path(_pending["pending_path"])

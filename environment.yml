@@ -12,6 +12,7 @@ dependencies:
   - pip
   - pip:
     - streamlit>=1.43
+    - streamlit-image-coordinates
     - Pillow
     - opencv-python-headless
     - pandas
