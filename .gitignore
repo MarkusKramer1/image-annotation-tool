@@ -13,5 +13,6 @@ data/
 WeDetect/checkpoints/*.pth
 WeDetect/checkpoints/wedetect_ref_*/
 
-# local model checkpoints
-checkpoints/sam2/*.pt
+# All local model weights (WeDetect, SAM 2, FastSAM, …)
+checkpoints/
+*.pt

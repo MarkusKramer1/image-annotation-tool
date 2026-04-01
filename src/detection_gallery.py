@@ -75,6 +75,10 @@ def build_gallery_entries(
         key=lambda p: p.name,
     )
 
+    cat_name: dict[int, str] = {
+        c["id"]: c["name"] for c in coco_data.get("categories", [])
+    }
+
     entries: list[dict[str, Any]] = []
     for img_idx, frame_path in enumerate(frame_files):
         img_info = coco_images.get(frame_path.name, {})
@@ -86,6 +90,7 @@ def build_gallery_entries(
         for box_idx, ann in enumerate(anns):
             aug = dict(ann)
             aug["bbox_id"] = f"{img_idx}-{box_idx}"
+            aug["category_name"] = cat_name.get(aug.get("category_id"), "?")
             annotated_anns.append(aug)
 
         entries.append(
@@ -143,10 +148,13 @@ def draw_detections(
 
         draw.rectangle([x, y, x + w, y + h], outline=outline_color, width=line_width)
 
-        # Label badge with bbox ID
-        label = bbox_id
+        # Label: class  score  (id)
+        cls_name = ann.get("category_name", "")
+        label = cls_name if cls_name and cls_name != "?" else bbox_id
         if "score" in ann:
-            label += f" {ann['score']:.2f}"
+            label += f"  {ann['score']:.2f}"
+        if cls_name and cls_name != "?":
+            label += f"  ({bbox_id})"
 
         # Measure text for background rect
         bbox_text = draw.textbbox((0, 0), label, font=font_small)
@@ -163,6 +171,171 @@ def draw_detections(
         pad = 5
         draw.rectangle([4, 4, 4 + bw + pad * 2, 4 + bh + pad * 2], fill=(20, 20, 20))
         draw.text((4 + pad, 4 + pad), badge_text, fill=(255, 220, 0), font=font_badge)
+
+    return img
+
+
+_RETRIEVAL_COLOR = (255, 200, 0)  # golden-yellow for proposed / retrieved boxes
+
+
+def draw_frame_with_proposals(
+    image_path: Path,
+    existing_annotations: list[dict[str, Any]],
+    proposals: list[tuple[int, dict[str, Any]]],
+    img_idx: int,
+) -> Image.Image:
+    """Render a frame showing existing detections and zero or more proposed bboxes.
+
+    Existing annotations are drawn in their normal palette colours.
+    Each proposed (retrieved) bbox is drawn in golden-yellow with a ``#N``
+    badge so the user can cross-reference cards with the selection list.
+
+    Args:
+        image_path: Path to the source frame.
+        existing_annotations: Confirmed annotations (must have ``bbox_id`` and
+            ``category_id`` as produced by ``build_gallery_entries``).
+        proposals: Ordered list of ``(match_index, match_dict)`` pairs.
+            ``match_dict`` must contain ``"bbox"`` [x,y,w,h], ``"similarity"``,
+            and ``"matched_query"`` with ``"category_name"``.
+            Pass an empty list for frames that have no proposed detections.
+        img_idx: Gallery index used by the existing-annotation draw call.
+
+    Returns:
+        A PIL Image with all annotations and proposals drawn.
+    """
+    img = draw_detections(image_path, existing_annotations, img_idx, draw_index_badge=False)
+    draw = ImageDraw.Draw(img)
+    font = _get_font(13)
+    font_badge = _get_font(15)
+
+    for match_index, m in proposals:
+        x, y, w, h = m["bbox"]
+        category_name = m.get("matched_query", {}).get("category_name", "?")
+        similarity = m.get("similarity", 0.0)
+
+        draw.rectangle([x, y, x + w, y + h], outline=_RETRIEVAL_COLOR, width=4)
+
+        # Top-left label: "#N  ? class  0.87"
+        label = f"#{match_index}  ? {category_name}  {similarity:.2f}"
+        bbox_text = draw.textbbox((0, 0), label, font=font)
+        tw = bbox_text[2] - bbox_text[0]
+        th = bbox_text[3] - bbox_text[1]
+        pad = 2
+        lx = int(x)
+        ly = max(0, int(y) - th - pad * 2)
+        draw.rectangle([lx, ly, lx + tw + pad * 2, ly + th + pad * 2], fill=_RETRIEVAL_COLOR)
+        draw.text((lx + pad, ly + pad), label, fill=(0, 0, 0), font=font)
+
+        # Top-right corner badge with dark background for visibility
+        badge = f"#{match_index}"
+        bb = draw.textbbox((0, 0), badge, font=font_badge)
+        bw, bh = bb[2] - bb[0], bb[3] - bb[1]
+        bpad = 4
+        bx = max(0, int(x + w) - bw - bpad * 2)
+        by = int(y)
+        draw.rectangle([bx, by, bx + bw + bpad * 2, by + bh + bpad * 2], fill=(20, 20, 20))
+        draw.text((bx + bpad, by + bpad), badge, fill=_RETRIEVAL_COLOR, font=font_badge)
+
+    return img
+
+
+def draw_retrieval_match(
+    image_path: Path,
+    existing_annotations: list[dict[str, Any]],
+    proposed_bbox: list[float],
+    similarity: float,
+    category_name: str,
+    img_idx: int,
+    match_index: int | None = None,
+) -> Image.Image:
+    """Convenience wrapper: render one proposed bbox on a frame.
+
+    Delegates to ``draw_frame_with_proposals`` for a single proposal entry.
+    """
+    proposal_dict: dict[str, Any] = {
+        "bbox": proposed_bbox,
+        "similarity": similarity,
+        "matched_query": {"category_name": category_name},
+    }
+    proposals = [(match_index if match_index is not None else 0, proposal_dict)]
+    return draw_frame_with_proposals(image_path, existing_annotations, proposals, img_idx)
+
+
+def draw_detections_with_masks(
+    image_path: Path,
+    annotations: list[dict[str, Any]],
+    img_idx: int,
+    mask_alpha: int = 90,
+) -> Image.Image:
+    """Render bounding boxes AND semi-transparent polygon segmentation masks.
+
+    Annotations that have no ``segmentation`` field are drawn with their bbox
+    only.  Annotations with a ``segmentation`` field (COCO polygon list) get a
+    colour-matched semi-transparent fill underneath the bounding box outline.
+
+    Args:
+        image_path: Path to the source image.
+        annotations: List of annotation dicts (must have ``bbox_id`` and
+            optionally ``segmentation``).
+        img_idx: Gallery index; painted as a badge in the top-left corner.
+        mask_alpha: Opacity of the polygon fill (0 = invisible, 255 = opaque).
+
+    Returns:
+        A PIL Image with bounding boxes and mask overlays drawn.
+    """
+    img = Image.open(image_path).convert("RGBA")
+    overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    overlay_draw = ImageDraw.Draw(overlay)
+
+    for ann in annotations:
+        color_idx = ann.get("category_id", 1) % len(_PALETTE)
+        r, g, b = _PALETTE[color_idx]
+        for poly in ann.get("segmentation", []):
+            if len(poly) < 6:
+                continue
+            points = [(poly[i], poly[i + 1]) for i in range(0, len(poly) - 1, 2)]
+            if len(points) >= 3:
+                overlay_draw.polygon(points, fill=(r, g, b, mask_alpha))
+
+    img = Image.alpha_composite(img, overlay).convert("RGB")
+
+    # Draw bounding boxes and labels on top of the mask layer
+    draw = ImageDraw.Draw(img)
+    font_small = _get_font(13)
+    font_badge = _get_font(16)
+
+    for ann in annotations:
+        bbox_id: str = ann.get("bbox_id", "")
+        x, y, w, h = ann["bbox"]
+        color_idx = ann.get("category_id", 1) % len(_PALETTE)
+        color = _PALETTE[color_idx]
+        has_mask = bool(ann.get("segmentation"))
+
+        line_width = 3 if has_mask else 2
+        draw.rectangle([x, y, x + w, y + h], outline=color, width=line_width)
+
+        cls_name = ann.get("category_name", "")
+        label = cls_name if cls_name and cls_name != "?" else bbox_id
+        if "score" in ann:
+            label += f"  {ann['score']:.2f}"
+        if cls_name and cls_name != "?":
+            label += f"  ({bbox_id})"
+        if has_mask:
+            label += " ✓"
+
+        bbox_text = draw.textbbox((0, 0), label, font=font_small)
+        tw, th = bbox_text[2] - bbox_text[0], bbox_text[3] - bbox_text[1]
+        pad = 2
+        lx, ly = int(x), max(0, int(y) - th - pad * 2)
+        draw.rectangle([lx, ly, lx + tw + pad * 2, ly + th + pad * 2], fill=color)
+        draw.text((lx + pad, ly + pad), label, fill=(255, 255, 255), font=font_small)
+
+    badge_text = f"#{img_idx}"
+    bbox_badge = draw.textbbox((0, 0), badge_text, font=font_badge)
+    bw, bh = bbox_badge[2] - bbox_badge[0], bbox_badge[3] - bbox_badge[1]
+    pad = 5
+    draw.rectangle([4, 4, 4 + bw + pad * 2, 4 + bh + pad * 2], fill=(20, 20, 20))
+    draw.text((4 + pad, 4 + pad), badge_text, fill=(255, 220, 0), font=font_badge)
 
     return img
 

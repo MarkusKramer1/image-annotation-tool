@@ -250,19 +250,20 @@ def main() -> None:
                     "bbox": [round(x1, 2), round(y1, 2), round(bw, 2), round(bh, 2)],
                     "area": round(bw * bh, 2),
                     "iscrowd": 0,
+                    "score": round(float(score), 4),
                 })
                 ann_id += 1
 
             # Draw detection boxes for the thumbnail
             draw = ImageDraw.Draw(pil_img)
-            for bbox, label_idx in zip(bboxes, label_ids):
+            for bbox, label_idx, score in zip(bboxes, label_ids, scores):
                 cat_id = int(label_idx) + 1
                 if cat_id > len(class_names):
                     continue
                 color = COLORS[int(label_idx) % len(COLORS)]
                 x1, y1, x2, y2 = int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])
                 draw.rectangle([x1, y1, x2, y2], outline=color, width=2)
-                label_text = class_names[int(label_idx)]
+                label_text = f"{class_names[int(label_idx)]}  {float(score):.2f}"
                 label_y = max(0, y1 - 15)
                 try:
                     tb = draw.textbbox((x1, label_y), label_text, font=font)
