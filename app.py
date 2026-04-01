@@ -3,8 +3,8 @@
 Multi-page Streamlit app for semi-automated dataset annotation:
   1. Data Extraction — video to frames
   2. Base Class Detection — WeDetect open-vocabulary detection
-  3. Exact Class Detection — embedding clustering (coming soon)
-  4. Segmentation Masks — pixel-level masks (coming soon)
+  3. Exact Class Detection — embedding clustering
+  4. Segmentation Masks — pixel-level masks (SAM2)
 """
 
 import streamlit as st
@@ -32,8 +32,8 @@ st.subheader("Pipeline")
 stages = [
     ("1 — Data Extraction", "Extract frames from a video file."),
     ("2 — Base Class Detection", "Run WeDetect open-vocabulary detection on extracted frames."),
-    ("3 — Exact Class Detection", "Refine base classes via embedding clustering. *(coming soon)*"),
-    ("4 — Segmentation Masks", "Generate pixel-level masks for detections. *(coming soon)*"),
+    ("3 — Exact Class Detection", "Refine base classes via embedding clustering."),
+    ("4 — Segmentation Masks", "Generate pixel-level masks for detections."),
 ]
 
 cols = st.columns(len(stages))

@@ -12,3 +12,6 @@ data/
 # Large model checkpoints (download separately)
 WeDetect/checkpoints/*.pth
 WeDetect/checkpoints/wedetect_ref_*/
+
+# local model checkpoints
+checkpoints/sam2/*.pt
