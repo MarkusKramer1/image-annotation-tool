@@ -35,6 +35,55 @@ def _emit_log(msg: str) -> None:
     _emit({"type": "log", "msg": msg})
 
 
+_VIS_PALETTE = [
+    (220,  50,  50),
+    ( 50, 180,  50),
+    ( 50,  50, 220),
+    (255, 165,   0),
+    (180,  50, 180),
+    ( 50, 200, 200),
+    (200, 200,  50),
+    (100, 100, 200),
+]
+
+
+def _draw_seg_vis(
+    img_path: str,
+    annotations: list[dict],
+    cat_id_to_name: dict[int, str],
+) -> "Image.Image":
+    """Return a PIL Image with mask overlays and bounding boxes drawn."""
+    from PIL import Image, ImageDraw  # noqa: PLC0415
+
+    img = Image.open(img_path).convert("RGBA")
+    overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    ov_draw = ImageDraw.Draw(overlay)
+
+    for ann in annotations:
+        ci = ann.get("category_id", 1) % len(_VIS_PALETTE)
+        r, g, b = _VIS_PALETTE[ci]
+        for poly in ann.get("segmentation", []):
+            if len(poly) < 6:
+                continue
+            pts = [(poly[i], poly[i + 1]) for i in range(0, len(poly) - 1, 2)]
+            if len(pts) >= 3:
+                ov_draw.polygon(pts, fill=(r, g, b, 90))
+
+    img = Image.alpha_composite(img, overlay).convert("RGB")
+    draw = ImageDraw.Draw(img)
+
+    for ann in annotations:
+        ci = ann.get("category_id", 1) % len(_VIS_PALETTE)
+        color = _VIS_PALETTE[ci]
+        x, y, w, h = ann["bbox"]
+        draw.rectangle([x, y, x + w, y + h], outline=color, width=2)
+        label = cat_id_to_name.get(ann.get("category_id", -1), "")
+        if label:
+            draw.text((x + 3, y + 2), label, fill=color)
+
+    return img
+
+
 def _masks_to_polygons(masks_xy) -> list[list[float]]:
     """Convert ultralytics masks.xy (list of Nx2 arrays) to COCO polygon lists."""
     polys = []
@@ -115,6 +164,9 @@ def main() -> None:
                         help="Confidence threshold (FastSAM); ignored for SAM2")
     parser.add_argument("--imgsz", type=int, default=1024,
                         help="Inference image size")
+    parser.add_argument("--vis-dir", default="",
+                        help="Directory to write per-frame visualisation JPEGs into "
+                             "(optional; skipped when empty)")
     args = parser.parse_args()
 
     # ── Verify ultralytics ────────────────────────────────────────────────────
@@ -174,6 +226,11 @@ def main() -> None:
 
     ann_by_id: dict[int, dict] = {a["id"]: a for a in coco.get("annotations", [])}
 
+    vis_dir: Path | None = None
+    if args.vis_dir.strip():
+        vis_dir = Path(args.vis_dir.strip())
+        vis_dir.mkdir(parents=True, exist_ok=True)
+
     # ── Load model ────────────────────────────────────────────────────────────
     checkpoint = args.checkpoint
     ckpt_path = Path(checkpoint)
@@ -221,15 +278,19 @@ def main() -> None:
         fname = img_info["file_name"]
         img_path = images_dir / fname
 
-        _emit({
-            "type": "progress",
-            "current": img_idx + 1,
-            "total": total_images,
-            "msg": f"[{img_idx + 1}/{total_images}] {fname}",
-        })
+        _emit_log(f"[{img_idx + 1}/{total_images}] Processing {fname}…")
 
         if not img_path.exists():
             _emit_log(f"  WARNING: image not found: {img_path}, skipping")
+            _emit({
+                "type": "progress",
+                "current": img_idx + 1,
+                "total": total_images,
+                "msg": f"[{img_idx + 1}/{total_images}] {fname} — image not found, skipped",
+                "vis_path": None,
+                "frame_name": fname,
+                "n_masks": 0,
+            })
             continue
 
         qualifying_anns = [
@@ -238,6 +299,7 @@ def main() -> None:
             or cat_id_to_name.get(a.get("category_id", -1), "") in class_filter
         ]
 
+        n = 0
         try:
             if args.model_type == "fastsam":
                 n = _run_fastsam(predictor, str(img_path), qualifying_anns, ann_by_id)
@@ -246,6 +308,26 @@ def main() -> None:
             total_masks += n
         except Exception as exc:
             _emit_log(f"  ERROR on {fname}: {exc}\n{traceback.format_exc()}")
+
+        vis_path_str: str | None = None
+        if vis_dir is not None:
+            try:
+                vis_img = _draw_seg_vis(str(img_path), qualifying_anns, cat_id_to_name)
+                vis_file = vis_dir / (Path(fname).stem + "_seg.jpg")
+                vis_img.save(str(vis_file), format="JPEG", quality=75)
+                vis_path_str = str(vis_file)
+            except Exception as exc:
+                _emit_log(f"  WARNING: could not generate vis for {fname}: {exc}")
+
+        _emit({
+            "type": "progress",
+            "current": img_idx + 1,
+            "total": total_images,
+            "msg": f"[{img_idx + 1}/{total_images}] {fname}  ·  {n} mask(s)",
+            "vis_path": vis_path_str,
+            "frame_name": fname,
+            "n_masks": n,
+        })
 
     _emit_log(f"Generated {total_masks} mask(s)")
 

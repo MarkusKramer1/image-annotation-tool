@@ -16,6 +16,8 @@ FSDET_DIR = Path.home() / "hector" / "src" / "few-shot-object-detection"
 TEST_VIDEO_PATH = Path.home() / "Videos" / "athena_driving3.mp4"
 TEST_DATASET_NAME = "athena_driving3_test"
 
+DEFAULT_BAG_DIR = Path.home() / "bags"
+
 CONFIG_MAP = {
     "tiny":  ("config/wedetect_tiny.py",  "checkpoints/wedetect_tiny.pth"),
     "base":  ("config/wedetect_base.py",  "checkpoints/wedetect_base.pth"),

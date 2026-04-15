@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import io
 import json
 import os
 import shutil
@@ -22,7 +24,6 @@ from src.common import (
     FSDET_DIR,
     IMAGE_ROOT,
     PROJECT_ROOT,
-    TEST_DATASET_NAME,
     WEDETECT_DIR,
     discover_datasets,
     load_extraction_meta,
@@ -38,10 +39,10 @@ from src.detection_gallery import (
 from src.similarity_search import embed_crops, find_similar
 
 try:
-    from streamlit_image_coordinates import streamlit_image_coordinates as _sic
-    _SIC_AVAILABLE = True
+    from streamlit_drawable_canvas import st_canvas
+    _SDC_AVAILABLE = True
 except ImportError:
-    _SIC_AVAILABLE = False
+    _SDC_AVAILABLE = False
 
 # ── WeDetect-Uni checkpoint config ────────────────────────────────────────────
 UNI_CHECKPOINT_NAMES = {
@@ -226,46 +227,43 @@ if not datasets:
     )
     st.stop()
 
-col_ds, col_test = st.columns([3, 1])
-
-with col_test:
-    st.markdown("&nbsp;", unsafe_allow_html=True)
-    test_available = TEST_DATASET_NAME in datasets
-    test_clicked = st.button(
-        "Test Detection",
-        disabled=not test_available,
-        help=f"Run detection on `{TEST_DATASET_NAME}` with class 'robot'.",
-        use_container_width=True,
-    )
-
-if "detection_test_mode" not in st.session_state:
-    st.session_state.detection_test_mode = False
-if test_clicked:
-    st.session_state.detection_test_mode = True
-
-is_test_mode = st.session_state.detection_test_mode
-
-_default_idx = 0
-if is_test_mode and TEST_DATASET_NAME in datasets:
-    _default_idx = datasets.index(TEST_DATASET_NAME)
-
-with col_ds:
-    selected_dataset = st.selectbox(
-        "Dataset",
-        options=datasets,
-        index=_default_idx,
-    )
+selected_dataset = st.selectbox("Dataset", options=datasets)
 
 dataset_dir = DATA_DIR / selected_dataset
 frames_dir = dataset_dir / IMAGE_ROOT
 output_json_path = dataset_dir / "annotations" / "base_detection.json"
 
+_rm_col, _ = st.columns([1, 3])
+with _rm_col:
+    if st.button(
+        "Remove Annotations",
+        disabled=not output_json_path.exists(),
+        help=f"Permanently delete all annotations for `{selected_dataset}`.",
+        use_container_width=True,
+    ):
+        try:
+            output_json_path.unlink()
+            _load_gallery.clear()
+            st.session_state.pop("gallery_ready_dataset", None)
+            st.rerun()
+        except Exception as _exc:
+            st.error(f"Failed to remove annotations: {_exc}")
+
 meta = load_extraction_meta(dataset_dir)
 if meta:
+    _source_bags = meta.get("source_bags")
+    if _source_bags:
+        _source_str = ", ".join(f"`{b}`" for b in _source_bags)
+        _filters = meta.get("filters", {})
+        _fps = _filters.get("sample_fps", "all")
+        _step_str = f"topic `{meta.get('extraction_topic', '?')}` · {_fps} fps"
+    else:
+        _source_str = f"`{meta.get('source_video', '?')}`"
+        _step_str = f"step {meta.get('frame_step', '?')}"
     st.caption(
-        f"Source: `{meta.get('source_video', '?')}` · "
+        f"Source: {_source_str} · "
         f"{meta.get('num_frames', '?')} frames · "
-        f"step {meta.get('frame_step', '?')}"
+        f"{_step_str}"
     )
 
 # ─── Annotation overview ──────────────────────────────────────────────────────
@@ -418,9 +416,7 @@ with st.expander("1. Object Detection", expanded=True):
                 step=10,
             )
 
-        if is_test_mode:
-            _default_classes = "robot"
-        elif _existing_classes:
+        if _existing_classes:
             _default_classes = ", ".join(_existing_classes)
         else:
             _default_classes = ""
@@ -484,10 +480,10 @@ with st.expander("1. Object Detection", expanded=True):
             ),
         )
 
-        if not _SIC_AVAILABLE:
+        if not _SDC_AVAILABLE:
             st.error(
-                "`streamlit-image-coordinates` is not installed. "
-                "Run: `pip install streamlit-image-coordinates` in the project environment."
+                "`streamlit-drawable-canvas` is not installed. "
+                "Run: `pip install streamlit-drawable-canvas` in the project environment."
             )
 
         # ── Frame selector ────────────────────────────────────────────────────
@@ -510,8 +506,15 @@ with st.expander("1. Object Detection", expanded=True):
                 )
             with _vp_fc2:
                 st.markdown("&nbsp;", unsafe_allow_html=True)
-                st.caption(
-                    "**Click and drag** on the image to draw a bounding box around one example object."
+                _canvas_mode = st.radio(
+                    "Canvas mode",
+                    options=["Draw box", "Move / resize box"],
+                    horizontal=False,
+                    key="vp_canvas_mode",
+                    help=(
+                        "**Draw box** — drag to create a new bounding box.  \n"
+                        "**Move / resize box** — select and drag handles to adjust the existing box."
+                    ),
                 )
 
             _sel_frame_path = frames_dir / _sel_frame_name
@@ -524,65 +527,66 @@ with st.expander("1. Object Detection", expanded=True):
                 str(_sel_frame_path), _vp_display_w
             )
 
-            # Reset stored drag when the user switches to a different frame.
+            # Increment the canvas key when the user switches frames so it resets.
             if st.session_state.get("vp_coords_frame") != _sel_frame_name:
-                st.session_state.pop("vp_last_drag", None)
+                st.session_state.vp_img_key = st.session_state.get("vp_img_key", 0) + 1
                 st.session_state["vp_coords_frame"] = _sel_frame_name
 
             if "vp_img_key" not in st.session_state:
                 st.session_state.vp_img_key = 0
 
-            # ── Click-and-drag image widget ───────────────────────────────────
-            # If a box was already drawn, overlay it on the cached display image
-            # so only one image is shown.  Drawing the box on the small
-            # (700-px-wide) copy is cheap; no full-res re-encode needed.
-            _last_drag = st.session_state.get("vp_last_drag")
-
-            # Decode cached JPEG bytes into a PIL Image (small / fast).
+            # ── Drawable canvas widget ────────────────────────────────────────
+            # update_streamlit=False prevents reruns while drawing.  The canvas
+            # preserves its fabric.js state across Streamlit reruns (same key),
+            # so drawn boxes stay visible and json_data is returned on the next
+            # natural rerun (button click, text input, etc.).
+            # Changing drawing_mode does NOT clear the canvas (only a key change does).
             import io as _io2
-            _sic_source = Image.open(_io2.BytesIO(_vp_jpeg_bytes)).convert("RGB")
+            _canvas_bg = Image.open(_io2.BytesIO(_vp_jpeg_bytes)).convert("RGB")
+            _canvas_h = _canvas_bg.height
 
-            if _last_drag:
-                # Overlay the stored bbox on the display-sized image.
-                _px1 = round(min(_last_drag["x1"], _last_drag["x2"]))
-                _py1 = round(min(_last_drag["y1"], _last_drag["y2"]))
-                _px2 = round(max(_last_drag["x1"], _last_drag["x2"]))
-                _py2 = round(max(_last_drag["y1"], _last_drag["y2"]))
-                _pbw = max(1, _px2 - _px1)
-                _pbh = max(1, _py2 - _py1)
-                from PIL import ImageDraw as _ImageDraw
-                _ImageDraw.Draw(_sic_source).rectangle(
-                    [_px1, _py1, _px2, _py2], outline=(255, 50, 50), width=3
-                )
+            _canvas_draw_mode = (
+                "rect" if _canvas_mode == "Draw box" else "transform"
+            )
 
-            if _SIC_AVAILABLE:
-                _drag = _sic(
-                    _sic_source,
-                    click_and_drag=True,
-                    cursor="crosshair",
-                    image_format="JPEG",
-                    jpeg_quality=80,
-                    key=f"vp_sic_{st.session_state.vp_img_key}",
+            _clear_col, _ = st.columns([1, 4])
+            with _clear_col:
+                if st.button("Clear box", key="vp_clear_canvas", help="Remove the drawn box and start over."):
+                    st.session_state.vp_img_key += 1
+                    st.rerun()
+
+            if _SDC_AVAILABLE:
+                _canvas_result = st_canvas(
+                    fill_color="rgba(255, 50, 50, 0.15)",
+                    stroke_width=3,
+                    stroke_color="#FF3232",
+                    background_image=_canvas_bg,
+                    update_streamlit=True,
+                    height=_canvas_h,
+                    width=_vp_display_w,
+                    drawing_mode=_canvas_draw_mode,
+                    key=f"vp_canvas_{st.session_state.vp_img_key}",
                 )
-                if _drag is not None:
-                    st.session_state.vp_last_drag = _drag
-                    _last_drag = _drag
-                    _px1 = round(min(_drag["x1"], _drag["x2"]))
-                    _py1 = round(min(_drag["y1"], _drag["y2"]))
-                    _px2 = round(max(_drag["x1"], _drag["x2"]))
-                    _py2 = round(max(_drag["y1"], _drag["y2"]))
-                    _pbw = max(1, _px2 - _px1)
-                    _pbh = max(1, _py2 - _py1)
             else:
-                _drag = None
+                _canvas_result = None
 
-            if _last_drag:
-                # Convert display coords → original image coords for the caption
-                _scale = _vp_iw / _vp_display_w
+            # Derive _canvas_objects from whatever the canvas reports on this rerun.
+            _canvas_objects: list = []
+            if _canvas_result is not None and _canvas_result.json_data is not None:
+                _canvas_objects = _canvas_result.json_data.get("objects", [])
+
+            _has_boxes = bool(_canvas_objects)
+            # Use the first drawn box just to keep the existing disabled-check variable name.
+            _last_drag = _canvas_objects[0] if _has_boxes else None
+
+            if _has_boxes:
+                _n_boxes = len(_canvas_objects)
                 st.caption(
-                    f"Box (original px) — x={round(_px1*_scale)} y={round(_py1*_scale)} "
-                    f"w={round(_pbw*_scale)} h={round(_pbh*_scale)} · drag again to replace"
+                    f"{_n_boxes} box{'es' if _n_boxes > 1 else ''} drawn · "
+                    "switch to **Move / resize** mode to adjust · draw more or click **Add**."
                 )
+            else:
+                st.caption("Draw bounding boxes on the image above, then enter a label and click **Add**.")
 
             # ── Label + Add button ────────────────────────────────────────────
             _add_col1, _add_col2 = st.columns([4, 1])
@@ -598,33 +602,42 @@ with st.expander("1. Object Detection", expanded=True):
                     "Add",
                     key="vp_add_btn",
                     use_container_width=True,
-                    disabled=not (_SIC_AVAILABLE and _last_drag is not None and bool(_vp_label.strip())),
+                    disabled=not (_SDC_AVAILABLE and _last_drag is not None and bool(_vp_label.strip())),
                 )
 
             if _add_vp_clicked:
+                # Re-read canvas objects on this rerun (triggered by the button click).
+                _add_objects = (
+                    _canvas_result.json_data.get("objects", [])
+                    if _canvas_result is not None and _canvas_result.json_data is not None
+                    else []
+                )
                 if not _vp_label.strip():
                     st.warning("Please enter a label before adding.")
-                elif not _last_drag:
-                    st.warning("Please draw a bounding box first.")
+                elif not _add_objects:
+                    st.warning("Please draw at least one bounding box on the canvas first.")
                 else:
-                    # Scale display-space coords → original image coords
                     _ascale = _vp_iw / _vp_display_w
-                    _fx1 = round(min(_last_drag["x1"], _last_drag["x2"]) * _ascale)
-                    _fy1 = round(min(_last_drag["y1"], _last_drag["y2"]) * _ascale)
-                    _fx2 = round(max(_last_drag["x1"], _last_drag["x2"]) * _ascale)
-                    _fy2 = round(max(_last_drag["y1"], _last_drag["y2"]) * _ascale)
-
                     if "visual_prompts" not in st.session_state:
                         st.session_state.visual_prompts = []
 
-                    st.session_state.visual_prompts.append({
-                        "image_name": _sel_frame_name,
-                        "image_path": str(_sel_frame_path),
-                        "bbox":       [_fx1, _fy1, max(1, _fx2 - _fx1), max(1, _fy2 - _fy1)],
-                        "label":      _vp_label.strip(),
-                    })
-                    # Reset for next prompt
-                    st.session_state.pop("vp_last_drag", None)
+                    for _obj in _add_objects:
+                        _rx = _obj.get("left", 0)
+                        _ry = _obj.get("top", 0)
+                        _rw = abs(_obj.get("width", 0) * _obj.get("scaleX", 1))
+                        _rh = abs(_obj.get("height", 0) * _obj.get("scaleY", 1))
+                        st.session_state.visual_prompts.append({
+                            "image_name": _sel_frame_name,
+                            "image_path": str(_sel_frame_path),
+                            "bbox":       [
+                                round(_rx * _ascale),
+                                round(_ry * _ascale),
+                                max(1, round(_rw * _ascale)),
+                                max(1, round(_rh * _ascale)),
+                            ],
+                            "label":      _vp_label.strip(),
+                        })
+                    # Reset canvas for the next round of drawing.
                     st.session_state.vp_img_key += 1
                     st.rerun()
 
@@ -648,7 +661,13 @@ with st.expander("1. Object Detection", expanded=True):
                             min(_vp_img.height, _vy + _vh + 4),
                         ))
                         _vp_crop.thumbnail((80, 80), Image.LANCZOS)
-                        st.image(_vp_crop, width=80)
+                        _vp_buf = io.BytesIO()
+                        _vp_crop.save(_vp_buf, format="PNG")
+                        _vp_b64 = base64.b64encode(_vp_buf.getvalue()).decode()
+                        st.markdown(
+                            f'<img src="data:image/png;base64,{_vp_b64}" width="80"/>',
+                            unsafe_allow_html=True,
+                        )
                     except Exception:
                         st.markdown("⬛")
                 with _vp_c2:
@@ -732,6 +751,26 @@ with st.expander("1. Object Detection", expanded=True):
                     ),
                 )
 
+            _vp_nms_c1, _vp_nms_c2, _vp_nms_c3 = st.columns([1, 2, 3])
+            with _vp_nms_c1:
+                _vp_nms = st.checkbox(
+                    "Apply NMS",
+                    value=True,
+                    key="vp_wedetect_nms",
+                    help=(
+                        "Per-frame per-class Non-Maximum Suppression: removes overlapping "
+                        "detections after similarity matching, before the top-K cut."
+                    ),
+                )
+            with _vp_nms_c2:
+                _vp_nms_iou = st.slider(
+                    "NMS IoU threshold",
+                    min_value=0.10, max_value=0.90, value=0.50, step=0.05,
+                    key="vp_wedetect_nms_iou",
+                    disabled=not _vp_nms,
+                    help="Boxes with IoU ≥ this are suppressed (lower = more aggressive).",
+                )
+
             _vp_backend_ready = _vp_ckpt_path.exists()
 
         else:  # YOLO-E
@@ -802,7 +841,7 @@ with st.expander("1. Object Detection", expanded=True):
         run_clicked = False
 
         can_run_visual = (
-            _SIC_AVAILABLE
+            _SDC_AVAILABLE
             and bool(_vp_list)
             and _vp_backend_ready
         )
@@ -815,8 +854,8 @@ with st.expander("1. Object Detection", expanded=True):
         )
 
         if not can_run_visual and not run_visual_clicked:
-            if not _SIC_AVAILABLE:
-                st.info("Install `streamlit-image-coordinates` to enable visual detection.")
+            if not _SDC_AVAILABLE:
+                st.info("Install `streamlit-drawable-canvas` to enable visual detection.")
             elif not _vp_list:
                 st.info("Add at least one visual prompt above to enable detection.")
             elif not _vp_backend_ready:
@@ -827,7 +866,7 @@ with st.expander("1. Object Detection", expanded=True):
 
     # ── Detection pipeline ────────────────────────────────────────────────────
     _pending_key = f"pending_detection_{selected_dataset}"
-    should_run_text   = detect_mode == "Text prompts"   and (run_clicked or (is_test_mode and test_clicked))
+    should_run_text   = detect_mode == "Text prompts"   and run_clicked
     should_run_visual = detect_mode == "Visual prompts" and run_visual_clicked
 
     # ── TEXT detection pipeline ───────────────────────────────────────────────
@@ -939,7 +978,6 @@ with st.expander("1. Object Detection", expanded=True):
         stderr_thread.join(timeout=3.0)
 
         status_text.empty()
-        st.session_state.detection_test_mode = False
 
         if done_data:
             det_progress.progress(1.0, text="Detection complete — review results and click Apply.")
@@ -953,7 +991,7 @@ with st.expander("1. Object Detection", expanded=True):
             st.warning("Processing ended without a completion message.")
 
         if stderr_lines:
-            with st.expander("Process output / errors"):
+            if st.checkbox("Show process output / errors", key="tp_stderr_expander"):
                 st.code("\n".join(stderr_lines[-200:]), language=None)
 
     # ── VISUAL detection pipeline ─────────────────────────────────────────────
@@ -997,7 +1035,10 @@ with st.expander("1. Object Detection", expanded=True):
                     "--min-similarity",  str(_vp_min_sim),
                     "--score-threshold", str(_vp_score_thr),
                     "--max-overlap",     str(_vp_max_overlap),
+                    "--nms-iou",         str(_vp_nms_iou),
                 ]
+                if _vp_nms:
+                    vp_cmd.append("--nms")
                 if output_json_path.exists() and _vp_max_overlap > 0:
                     vp_cmd += ["--annotation-json", str(output_json_path)]
             else:  # YOLO-E
@@ -1105,7 +1146,7 @@ with st.expander("1. Object Detection", expanded=True):
                 st.warning("Visual detection ended without a completion message.")
 
             if vp_stderr_lines:
-                with st.expander("Process output / errors"):
+                if st.checkbox("Show process output / errors", key="vp_stderr_expander"):
                     st.code("\n".join(vp_stderr_lines[-200:]), language=None)
 
         finally:
@@ -1533,6 +1574,29 @@ with st.expander("3. Search for Missing Detections", expanded=False):
             ),
         )
 
+    ret_nms_c1, ret_nms_c2, _ = st.columns([1, 2, 3])
+    with ret_nms_c1:
+        ret_nms = st.checkbox(
+            "Apply NMS",
+            value=True,
+            key="ret_nms",
+            help=(
+                "Per-frame Non-Maximum Suppression on the retrieved proposals: "
+                "overlapping matches are suppressed, keeping the highest-similarity box."
+            ),
+        )
+    with ret_nms_c2:
+        ret_nms_iou = st.slider(
+            "NMS IoU threshold",
+            min_value=0.10,
+            max_value=0.90,
+            value=0.50,
+            step=0.05,
+            key="ret_nms_iou",
+            disabled=not ret_nms,
+            help="Boxes with IoU ≥ this are suppressed (lower = more aggressive).",
+        )
+
     can_run_retrieval = (
         uni_checkpoint_path.exists()
         and num_total_dets > 0
@@ -1573,7 +1637,10 @@ with st.expander("3. Search for Missing Detections", expanded=False):
             "--max-overlap", str(ret_max_overlap),
             "--score-threshold", "0.0",
             "--query-classes", ",".join(ret_query_classes),
+            "--nms-iou", str(ret_nms_iou),
         ]
+        if ret_nms:
+            ret_cmd.append("--nms")
 
         clean_env = os.environ.copy()
         clean_env.pop("PYTHONPATH", None)
@@ -1649,7 +1716,7 @@ with st.expander("3. Search for Missing Detections", expanded=False):
             st.warning("Retrieval ended without a completion message.")
 
         if ret_stderr_lines:
-            with st.expander("Process output / errors"):
+            if st.checkbox("Show process output / errors", key="ret_stderr_expander"):
                 st.code("\n".join(ret_stderr_lines[-200:]), language=None)
 
     if not st.session_state.get("retrieval_results") and retrieval_output_path.exists():
@@ -1714,7 +1781,7 @@ with st.expander("3. Search for Missing Detections", expanded=False):
                     except Exception as exc:
                         col.warning(f"Could not render {fname}: {exc}")
 
-            with st.expander("Match details", expanded=False):
+            if st.checkbox("Show match details", key="ret_match_details"):
                 df_ret = pd.DataFrame(
                     [
                         {
@@ -1992,6 +2059,7 @@ with st.expander("4. Generate Segmentation Masks", expanded=False):
         seg_logs: list[str] = []
 
         model_type_arg = "sam2" if seg_model_family == "SAM 2" else "fastsam"
+        _vis_seg_dir = dataset_dir / "_vis_seg"
 
         seg_cmd = [
             sys.executable,
@@ -2004,6 +2072,7 @@ with st.expander("4. Generate Segmentation Masks", expanded=False):
             "--classes",         ",".join(seg_classes),
             "--conf",            str(seg_conf),
             "--imgsz",           str(seg_imgsz),
+            "--vis-dir",         str(_vis_seg_dir),
         ]
 
         clean_env = os.environ.copy()
@@ -2020,6 +2089,8 @@ with st.expander("4. Generate Segmentation Masks", expanded=False):
         )
 
         seg_progress = st.progress(0.0)
+        seg_thumbnails_placeholder = st.empty()
+        seg_vis_entries: list[tuple[str, str, int]] = []
 
         for raw_line in seg_proc.stdout:
             raw_line = raw_line.rstrip()
@@ -2043,6 +2114,23 @@ with st.expander("4. Generate Segmentation Masks", expanded=False):
                 seg_status.info(evt.get("msg", "Running…"))
                 seg_logs.append(evt.get("msg", ""))
                 seg_log_box.code("\n".join(seg_logs[-30:]))
+
+                if evt.get("vis_path"):
+                    seg_vis_entries.append((
+                        evt["vis_path"],
+                        evt.get("frame_name", ""),
+                        evt.get("n_masks", 0),
+                    ))
+                    with seg_thumbnails_placeholder.container(height=450):
+                        visible = seg_vis_entries[-50:]
+                        thumb_cols = st.columns(4)
+                        for _i, (_vp, _fn, _nm) in enumerate(visible):
+                            thumb_cols[_i % 4].image(
+                                _vp,
+                                caption=f"{_fn} · {_nm} mask(s)",
+                                use_container_width=True,
+                            )
+
             elif t == "error":
                 seg_status.error(evt["msg"])
                 seg_logs.append("ERROR: " + evt["msg"])
@@ -2096,11 +2184,16 @@ with st.expander("4. Generate Segmentation Masks", expanded=False):
                     n_with_mask = sum(
                         1 for ann in entry["annotations"] if ann.get("segmentation")
                     )
-                    st.image(
-                        mask_img,
-                        caption=(
-                            f"{entry['file_name']}  ·  "
-                            f"{n_with_mask}/{len(entry['annotations'])} masked"
-                        ),
-                        use_container_width=True,
+                    _mask_buf = io.BytesIO()
+                    mask_img.save(_mask_buf, format="PNG")
+                    _mask_b64 = base64.b64encode(_mask_buf.getvalue()).decode()
+                    caption = (
+                        f"{entry['file_name']}  ·  "
+                        f"{n_with_mask}/{len(entry['annotations'])} masked"
+                    )
+                    st.markdown(
+                        f'<img src="data:image/png;base64,{_mask_b64}" '
+                        f'style="width:100%" alt="{caption}"/>'
+                        f'<p style="font-size:0.8em;color:grey">{caption}</p>',
+                        unsafe_allow_html=True,
                     )

@@ -11,10 +11,14 @@ dependencies:
   - pytorch-cuda=12.1
   - pip
   - pip:
-    - streamlit>=1.43
-    - streamlit-image-coordinates
+    - streamlit==1.40.2
+    - streamlit-drawable-canvas
     - Pillow
     - opencv-python-headless
     - pandas
     - tqdm
     - pycocotools
+    - rosbags
+    - ImageHash
+    - pyyaml
+    - numpy

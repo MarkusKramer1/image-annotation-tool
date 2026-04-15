@@ -88,6 +88,38 @@ def _normalise(arr: np.ndarray) -> np.ndarray:
     return arr / np.maximum(norms, 1e-6)
 
 
+def _nms_matches(matches: list[dict[str, Any]], iou_threshold: float) -> list[dict[str, Any]]:
+    """Per-frame greedy NMS on retrieved matches.
+
+    Within each frame, iterate matches in descending similarity order and
+    suppress any later match whose IoU with an already-kept match meets or
+    exceeds ``iou_threshold``.  Matches are already sorted by similarity
+    before this function is called.
+    """
+    from collections import defaultdict
+
+    by_frame: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for m in matches:
+        by_frame[m["file_name"]].append(m)
+
+    kept: list[dict[str, Any]] = []
+    for frame_matches in by_frame.values():
+        kept_boxes: list[list[float]] = []
+        for m in frame_matches:  # already sorted by similarity desc
+            bbox_xyxy = _xywh_to_xyxy(m["bbox"])
+            suppressed = False
+            if kept_boxes:
+                ious = _iou_one_vs_many(bbox_xyxy, np.array(kept_boxes, dtype=np.float32))
+                if float(ious.max()) >= iou_threshold:
+                    suppressed = True
+            if not suppressed:
+                kept.append(m)
+                kept_boxes.append(bbox_xyxy)
+
+    kept.sort(key=lambda x: x["similarity"], reverse=True)
+    return kept
+
+
 # ── Model loading ─────────────────────────────────────────────────────────────
 
 
@@ -162,6 +194,18 @@ def main() -> None:
             "Empty string = use all classes. All annotations are still used for the "
             "candidate-exclusion IoU check regardless of this filter."
         ),
+    )
+    parser.add_argument(
+        "--nms",
+        action="store_true",
+        default=False,
+        help="Apply per-frame Non-Maximum Suppression to retrieved matches.",
+    )
+    parser.add_argument(
+        "--nms-iou",
+        type=float,
+        default=0.50,
+        help="IoU threshold for NMS suppression (lower = more aggressive).",
     )
     args = parser.parse_args()
 
@@ -360,6 +404,14 @@ def main() -> None:
             matches.append(entry)
 
         matches.sort(key=lambda x: x["similarity"], reverse=True)
+
+        if args.nms and matches:
+            before_nms = len(matches)
+            matches = _nms_matches(matches, args.nms_iou)
+            _emit_log(
+                f"NMS (IoU ≥ {args.nms_iou:.2f}): {before_nms} → {len(matches)} matches."
+            )
+
         matches = matches[: args.top_k]
 
         # ── Save results ──────────────────────────────────────────────────────

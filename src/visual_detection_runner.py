@@ -89,6 +89,48 @@ def _normalise(arr: np.ndarray) -> np.ndarray:
     return arr / np.maximum(norms, 1e-6)
 
 
+def _nms(
+    boxes_xywh: list[list[float]],
+    scores: list[float],
+    iou_threshold: float,
+) -> list[int]:
+    """Greedy IoU-based NMS. Returns indices of kept boxes (original ordering)."""
+    if not boxes_xywh:
+        return []
+    boxes_xyxy = np.array([_xywh_to_xyxy(b) for b in boxes_xywh], dtype=np.float32)
+    order = np.array(scores, dtype=np.float32).argsort()[::-1]
+    kept: list[int] = []
+    while len(order) > 0:
+        i = int(order[0])
+        kept.append(i)
+        if len(order) == 1:
+            break
+        rest = order[1:]
+        ious = _iou_one_vs_many(boxes_xyxy[i].tolist(), boxes_xyxy[rest])
+        order = rest[ious < iou_threshold]
+    return kept
+
+
+def _apply_nms_to_matches(
+    matches: list[dict[str, Any]],
+    iou_threshold: float,
+) -> list[dict[str, Any]]:
+    """Apply per-frame per-class NMS to a flat list of match dicts."""
+    from collections import defaultdict
+    groups: dict[tuple[str, str], list[int]] = defaultdict(list)
+    for i, m in enumerate(matches):
+        groups[(m["file_name"], m["label"])].append(i)
+
+    kept_indices: set[int] = set()
+    for group_indices in groups.values():
+        boxes  = [matches[i]["bbox"]        for i in group_indices]
+        scores = [matches[i]["similarity"]   for i in group_indices]
+        for local_k in _nms(boxes, scores, iou_threshold):
+            kept_indices.add(group_indices[local_k])
+
+    return [m for i, m in enumerate(matches) if i in kept_indices]
+
+
 def _load_existing_annotations(
     annotation_json: str,
     max_overlap: float,
@@ -402,34 +444,72 @@ def _run_wedetect(args: argparse.Namespace) -> None:
         _emit({"type": "error", "msg": "No candidate proposals found across all frames."})
         return
 
-    # Phase 3: matching
+    # Phase 3: build per-label prototype embeddings (mean of all examples for
+    # that label, re-normalised).  This is more robust than matching against
+    # individual queries with max-pooling: it captures the *typical* appearance
+    # of each class and reduces the influence of outlier / imprecise boxes.
+    label_to_q_indices: dict[str, list[int]] = {}
+    for i, meta in enumerate(query_meta):
+        label_to_q_indices.setdefault(meta["label"], []).append(i)
+
+    prototype_embeds: list[np.ndarray] = []
+    prototype_meta: list[dict[str, Any]] = []
+    for label in unique_labels:
+        indices = label_to_q_indices.get(label, [])
+        if not indices:
+            continue
+        vecs = np.stack([query_embeds[i] for i in indices], axis=0)
+        proto = vecs.mean(axis=0)
+        norm = float(np.linalg.norm(proto))
+        proto = proto / max(norm, 1e-6)
+        prototype_embeds.append(proto)
+        prototype_meta.append({
+            "label":   label,
+            "cat_id":  label_to_cat_id[label],
+            "n_shots": len(indices),
+        })
+
     _emit_log(
-        f"Matching {len(query_embeds)} queries against "
-        f"{len(cand_embeds)} candidates…"
+        f"Built {len(prototype_embeds)} class prototype(s) from {len(query_embeds)} "
+        f"query embedding(s): "
+        + ", ".join(
+            f"'{m['label']}' ({m['n_shots']} shot{'s' if m['n_shots'] > 1 else ''})"
+            for m in prototype_meta
+        )
+        + f".  Matching against {len(cand_embeds)} candidates…"
     )
 
-    Q = np.stack(query_embeds, axis=0)
-    C = np.stack(cand_embeds,  axis=0)
-    sim_matrix = Q @ C.T
-    max_sim = sim_matrix.max(axis=0)
-    best_query_idx = sim_matrix.argmax(axis=0)
+    P = np.stack(prototype_embeds, axis=0)   # (num_classes, D)
+    C = np.stack(cand_embeds,      axis=0)   # (num_candidates, D)
+    sim_matrix = P @ C.T                      # (num_classes, num_candidates)
+    max_sim       = sim_matrix.max(axis=0)    # (num_candidates,) — best class match
+    best_proto_idx = sim_matrix.argmax(axis=0)
 
     matches: list[dict[str, Any]] = []
     for c_idx in range(len(cand_embeds)):
         sim = float(max_sim[c_idx])
         if sim < args.min_similarity:
             continue
-        q_idx = int(best_query_idx[c_idx])
+        p_idx = int(best_proto_idx[c_idx])
         entry = dict(cand_meta[c_idx])
-        entry["similarity"]   = sim
-        entry["label"]        = query_meta[q_idx]["label"]
-        entry["cat_id"]       = query_meta[q_idx]["cat_id"]
-        entry["query_source"] = query_meta[q_idx]["source_image"]
+        entry["similarity"] = sim
+        entry["label"]      = prototype_meta[p_idx]["label"]
+        entry["cat_id"]     = prototype_meta[p_idx]["cat_id"]
         matches.append(entry)
+
+    _emit_log(f"Found {len(matches)} match(es) above similarity threshold.")
+
+    if args.nms and matches:
+        before_nms = len(matches)
+        matches = _apply_nms_to_matches(matches, args.nms_iou)
+        _emit_log(
+            f"After NMS (IoU ≥ {args.nms_iou}): {len(matches)} match(es) "
+            f"({before_nms - len(matches)} suppressed)."
+        )
 
     matches.sort(key=lambda x: x["similarity"], reverse=True)
     matches = matches[: args.top_k]
-    _emit_log(f"Found {len(matches)} match(es) above threshold.")
+    _emit_log(f"Kept {len(matches)} match(es) after top-{args.top_k} cut.")
 
     # Phase 4: COCO JSON
     fname_to_img_id: dict[str, int] = {f.name: i + 1 for i, f in enumerate(frame_files)}
@@ -769,6 +849,10 @@ def main() -> None:
     parser.add_argument("--top-k",            type=int,   default=50)
     parser.add_argument("--min-similarity",   type=float, default=0.75)
     parser.add_argument("--score-threshold",  type=float, default=0.0)
+    parser.add_argument("--nms",              action="store_true",
+                        help="Apply per-frame per-class NMS after similarity matching.")
+    parser.add_argument("--nms-iou",          type=float, default=0.5,
+                        help="IoU threshold for NMS suppression.")
 
     # YOLO-E specific
     parser.add_argument("--fsdet-dir",        default="",
