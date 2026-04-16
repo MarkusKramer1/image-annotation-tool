@@ -441,10 +441,31 @@ with st.expander("1. Object Detection", expanded=True):
 
         checkpoint_path = WEDETECT_DIR / CONFIG_MAP[model_size][1]
         if not checkpoint_path.exists():
-            st.error(
-                f"Checkpoint `{checkpoint_path.name}` not found. "
-                "Download the model weights into `WeDetect/checkpoints/`."
-            )
+            _ckpt_c1, _ckpt_c2 = st.columns([4, 1])
+            with _ckpt_c1:
+                st.warning(
+                    f"Checkpoint `{checkpoint_path.name}` is missing from "
+                    "`WeDetect/checkpoints/`. Click **Download** to fetch it "
+                    "from [fushh7/WeDetect](https://huggingface.co/fushh7/WeDetect) "
+                    "(~1.5 GB for base, ~2.5 GB for large)."
+                )
+            with _ckpt_c2:
+                st.markdown("&nbsp;", unsafe_allow_html=True)
+                if st.button(
+                    "Download",
+                    key="dl_text_ckpt",
+                    type="primary",
+                    use_container_width=True,
+                ):
+                    with st.spinner(
+                        f"Downloading {checkpoint_path.name} from HuggingFace…"
+                    ):
+                        try:
+                            from src.checkpoint_manager import ensure_checkpoint
+                            ensure_checkpoint(checkpoint_path)
+                            st.rerun()
+                        except Exception as _dl_exc:
+                            st.error(f"Download failed: {_dl_exc}")
             st.stop()
 
         can_run = bool(classes_input.strip())
@@ -711,12 +732,30 @@ with st.expander("1. Object Detection", expanded=True):
 
             _vp_ckpt_path = Path(_vp_ckpt_input.strip())
             if not _vp_ckpt_path.exists():
-                st.warning(
-                    f"Checkpoint `{_vp_ckpt_path.name}` not found. "
-                    "Download **WeDetect-Base-Uni** or **WeDetect-Large-Uni** from "
-                    "[fushh7/WeDetect](https://huggingface.co/fushh7/WeDetect) "
-                    "and place it in `WeDetect/checkpoints/`."
-                )
+                _vpdl_c1, _vpdl_c2 = st.columns([4, 1])
+                with _vpdl_c1:
+                    st.warning(
+                        f"Checkpoint `{_vp_ckpt_path.name}` is missing from "
+                        "`WeDetect/checkpoints/`. Click **Download** to fetch it "
+                        "from [fushh7/WeDetect](https://huggingface.co/fushh7/WeDetect)."
+                    )
+                with _vpdl_c2:
+                    st.markdown("&nbsp;", unsafe_allow_html=True)
+                    if st.button(
+                        "Download",
+                        key="dl_vp_uni_ckpt",
+                        type="primary",
+                        use_container_width=True,
+                    ):
+                        with st.spinner(
+                            f"Downloading {_vp_ckpt_path.name} from HuggingFace…"
+                        ):
+                            try:
+                                from src.checkpoint_manager import ensure_checkpoint
+                                ensure_checkpoint(_vp_ckpt_path)
+                                st.rerun()
+                            except Exception as _dl_exc:
+                                st.error(f"Download failed: {_dl_exc}")
 
             _vp_param_c1, _vp_param_c2, _vp_param_c3, _vp_param_c4 = st.columns(4)
             with _vp_param_c1:
@@ -1515,12 +1554,30 @@ with st.expander("3. Search for Missing Detections", expanded=False):
     uni_checkpoint_path = Path(uni_checkpoint_input.strip())
 
     if not uni_checkpoint_path.exists():
-        st.warning(
-            f"WeDetect-Uni checkpoint not found at `{uni_checkpoint_path}`. "
-            "Download **WeDetect-Base-Uni** or **WeDetect-Large-Uni** from "
-            "[fushh7/WeDetect](https://huggingface.co/fushh7/WeDetect) on HuggingFace "
-            "and place it in `WeDetect/checkpoints/`."
-        )
+        _retdl_c1, _retdl_c2 = st.columns([4, 1])
+        with _retdl_c1:
+            st.warning(
+                f"Checkpoint `{uni_checkpoint_path.name}` is missing from "
+                "`WeDetect/checkpoints/`. Click **Download** to fetch it "
+                "from [fushh7/WeDetect](https://huggingface.co/fushh7/WeDetect)."
+            )
+        with _retdl_c2:
+            st.markdown("&nbsp;", unsafe_allow_html=True)
+            if st.button(
+                "Download",
+                key="dl_ret_uni_ckpt",
+                type="primary",
+                use_container_width=True,
+            ):
+                with st.spinner(
+                    f"Downloading {uni_checkpoint_path.name} from HuggingFace…"
+                ):
+                    try:
+                        from src.checkpoint_manager import ensure_checkpoint
+                        ensure_checkpoint(uni_checkpoint_path)
+                        st.rerun()
+                    except Exception as _dl_exc:
+                        st.error(f"Download failed: {_dl_exc}")
 
     all_classes_for_retrieval = sorted({
         ann.get("category_name", "?")
